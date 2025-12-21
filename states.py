@@ -1,4 +1,5 @@
-from aiogram.fsm.state import StatesGroup, State
+from aiogram.dispatcher.filters.state import StatesGroup, State
+
 
 class LeadForm(StatesGroup):
     name = State()
@@ -9,6 +10,7 @@ class LeadForm(StatesGroup):
     ready_time = State()
     phone = State()
     contact_method = State()
+
 
 class ManagerAuth(StatesGroup):
     password = State()
