@@ -1,3 +1,2 @@
-aiogram==3.3.0
-pydantic==1.10.13
+aiogram==2.25.1
 python-dotenv==1.0.1
