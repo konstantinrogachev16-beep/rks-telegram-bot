@@ -1,5 +1,5 @@
 services:
-  - type: worker
+  - type: web
     name: rks-telegram-bot
     env: python
     plan: free
