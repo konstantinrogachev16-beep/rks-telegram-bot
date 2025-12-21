@@ -1,6 +1,5 @@
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.types import InlineKeyboardMarkup
+
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
 SEGMENTS = [
     ("😕 Уставшая (тусклая/матовая)", "SEG_TIRED"),
@@ -43,40 +42,44 @@ CONTACT_METHODS = [
     ("Telegram", "TG"),
 ]
 
+
 def start_kb() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Начать диагностику", callback_data="START_FLOW")
-    return kb.as_markup()
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Начать диагностику", callback_data="START_FLOW")]
+        ]
+    )
+
 
 def segments_kb() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
+    kb = InlineKeyboardMarkup(row_width=1)
     for text, code in SEGMENTS:
-        kb.button(text=text, callback_data=f"SEG:{code}")
-    kb.adjust(1)
-    return kb.as_markup()
+        kb.add(InlineKeyboardButton(text=text, callback_data=f"SEG:{code}"))
+    return kb
+
 
 def pains_kb() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
+    kb = InlineKeyboardMarkup(row_width=1)
     for text, code in PAINS:
-        kb.button(text=text, callback_data=f"PAIN:{code}")
-    kb.adjust(1)
-    return kb.as_markup()
+        kb.add(InlineKeyboardButton(text=text, callback_data=f"PAIN:{code}"))
+    return kb
 
-def services_kb(selected: set[str]) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
+
+def services_kb(selected: set) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
     for text, code in SERVICES:
         mark = "✅ " if code in selected else ""
-        kb.button(text=f"{mark}{text}", callback_data=f"SRV:{code}")
-    kb.button(text="Готово ✅", callback_data="SRV:DONE")
-    kb.adjust(1)
-    return kb.as_markup()
+        kb.add(InlineKeyboardButton(text=f"{mark}{text}", callback_data=f"SRV:{code}"))
+    kb.add(InlineKeyboardButton(text="Готово ✅", callback_data="SRV:DONE"))
+    return kb
+
 
 def ready_kb() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
+    kb = InlineKeyboardMarkup(row_width=1)
     for text, code in READY:
-        kb.button(text=text, callback_data=f"READY:{code}")
-    kb.adjust(1)
-    return kb.as_markup()
+        kb.add(InlineKeyboardButton(text=text, callback_data=f"READY:{code}"))
+    return kb
+
 
 def phone_request_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -85,9 +88,9 @@ def phone_request_kb() -> ReplyKeyboardMarkup:
         one_time_keyboard=True
     )
 
+
 def contact_method_kb() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
+    kb = InlineKeyboardMarkup(row_width=1)
     for text, code in CONTACT_METHODS:
-        kb.button(text=text, callback_data=f"CM:{code}")
-    kb.adjust(1)
-    return kb.as_markup()
+        kb.add(InlineKeyboardButton(text=text, callback_data=f"CM:{code}"))
+    return kb
