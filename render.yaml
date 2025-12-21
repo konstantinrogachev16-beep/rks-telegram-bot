@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: rks-telegram-bot
+    env: python
+    buildCommand: python -m pip install --upgrade pip setuptools wheel && pip install -r requirements.txt
+    startCommand: python bot.py
