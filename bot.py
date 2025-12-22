@@ -21,13 +21,12 @@ logging.basicConfig(
 logger = logging.getLogger("rks-bot")
 
 # ----------------- env -----------------
-load_dotenv()  # локально читает .env, на Render не мешает
+load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN not set")
 
-MANAGER_CHAT_ID = os.getenv("MANAGER_CHAT_ID", "327140660")  # по умолчанию твой ID
-
+MANAGER_CHAT_ID = os.getenv("MANAGER_CHAT_ID", "327140660")
 
 # ----------------- states -----------------
 ASK_NAME, ASK_CONTEXT, ASK_PAIN, ASK_RESULT, ASK_CONTACT = range(5)
@@ -43,7 +42,6 @@ def normalize_phone(s: str) -> str | None:
     if len(only_digits) < 10:
         return None
 
-    # РФ приведение 8XXXXXXXXXX -> +7XXXXXXXXXX
     if digits.startswith("8") and len(only_digits) == 11:
         digits = "+7" + only_digits[1:]
     elif digits.startswith("7") and len(only_digits) == 11:
@@ -52,19 +50,6 @@ def normalize_phone(s: str) -> str | None:
         digits = "+7" + only_digits[-10:]
 
     return digits
-
-
-def lead_to_text(user, data: dict) -> str:
-    username = f"@{user.username}" if user and user.username else "(нет username)"
-    return (
-        "🔥 НОВЫЙ ЛИД\n"
-        f"Имя: {data.get('name','')}\n"
-        f"TG: {username}\n"
-        f"Контекст: {data.get('context','')}\n"
-        f"Боль: {data.get('pain','')}\n"
-        f"Результат: {data.get('result','')}\n"
-        f"Контакт: {data.get('phone','') or 'Telegram'}\n"
-    )
 
 
 def contact_kb() -> ReplyKeyboardMarkup:
@@ -87,6 +72,80 @@ def restart_kb() -> ReplyKeyboardMarkup:
     )
 
 
+def lead_to_text(user, data: dict) -> str:
+    username = f"@{user.username}" if user and user.username else "(нет username)"
+    return (
+        "🔥 НОВЫЙ ЛИД\n"
+        f"Имя: {data.get('name','')}\n"
+        f"TG: {username}\n"
+        f"Контекст: {data.get('context','')}\n"
+        f"Боль: {data.get('pain','')}\n"
+        f"Результат: {data.get('result','')}\n"
+        f"Контакт: {data.get('phone','') or 'Telegram'}\n"
+    )
+
+
+def build_recommendation(context_text: str, pain_text: str, result_text: str) -> str:
+    """
+    Простая “умная” рекомендация по ключевым словам.
+    Можно расширять сколько угодно.
+    """
+    t = f"{context_text} {pain_text} {result_text}".lower()
+
+    services = []
+    reasons = []
+
+    # стекла / налет / водный камень
+    if any(k in t for k in ["налет", "налёт", "водный камень", "разводы", "пятна", "стекл", "лобов"]):
+        services.append("✅ Удаление водного камня со стёкол")
+        reasons.append("убирает налёт/пятна, улучшает обзор и внешний вид")
+
+    # дождь / вода / видимость
+    if any(k in t for k in ["антидожд", "дожд", "вода", "капли", "видимост"]):
+        services.append("✅ Покрытие «Антидождь»")
+        reasons.append("вода скатывается, в дождь видимость лучше, стёкла дольше чистые")
+
+    # тускло / матово / царапины / блеск
+    if any(k in t for k in ["туск", "матов", "потерял блеск", "блеск", "паутин", "царап", "микроцарап"]):
+        services.append("✅ Полировка кузова")
+        reasons.append("возвращает глубину цвета и блеск, убирает мелкие царапины/«паутинку»")
+
+    # фары
+    if any(k in t for k in ["фары", "фара", "мутные", "пожелтел", "желтые", "светит хуже"]):
+        services.append("✅ Полировка фар")
+        reasons.append("улучшает свет и внешний вид, фары снова прозрачные")
+
+    # тонировка (если упоминают жару/солнце/комфорт/приватность)
+    if any(k in t for k in ["тонир", "жара", "солнц", "приват", "комфорт", "слепит", "нагрев"]):
+        services.append("✅ Тонировка")
+        reasons.append("меньше нагрев/ослепление, комфорт и приватность")
+
+    # если ничего не нашли — универсальный вариант
+    if not services:
+        services = [
+            "✅ Полировка кузова (если нужен «вау-блеск»)",
+            "✅ Антидождь (если важна видимость и чистые стёкла)",
+        ]
+        reasons = [
+            "подбираем по состоянию ЛКП после осмотра",
+            "даёт практичный эффект уже в первую поездку под дождём",
+        ]
+
+    # собираем текст
+    services_block = "\n".join(services[:3])
+    reasons_block = "\n".join([f"• {r}" for r in reasons[:3]])
+
+    return (
+        "Понял тебя 👍\n\n"
+        "По описанию, лучше всего зайдёт вот такой набор:\n"
+        f"{services_block}\n\n"
+        "Почему это подходит:\n"
+        f"{reasons_block}\n\n"
+        "Хочешь — подскажу оптимальный вариант по бюджету и срокам. "
+        "Оставь контакт — и я передам менеджеру 👇"
+    )
+
+
 # ----------------- handlers -----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
@@ -101,7 +160,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
-    # быстрый перезапуск
     if text.lower().startswith("пройти диагностику"):
         return await start(update, context)
 
@@ -153,27 +211,24 @@ async def ask_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["result"] = txt
 
-    await update.message.reply_text(
-        "Спасибо, картина ясна 👍\n\n"
-        "Чтобы передать всё менеджеру и подобрать лучшее решение, оставь удобный контакт:\n"
-        "• нажми «Отправить контакт»\n"
-        "• или напиши номер текстом\n"
-        "• или просто скажи «можно сюда в Telegram»",
-        reply_markup=contact_kb(),
+    # --- авто-рекомендация клиенту ---
+    rec = build_recommendation(
+        context.user_data.get("context", ""),
+        context.user_data.get("pain", ""),
+        context.user_data.get("result", ""),
     )
+    await update.message.reply_text(rec, reply_markup=contact_kb())
+
     return ASK_CONTACT
 
 
 async def ask_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # контакт кнопкой
     if update.message.contact and update.message.contact.phone_number:
         phone = normalize_phone(update.message.contact.phone_number) or update.message.contact.phone_number
         context.user_data["phone"] = phone
         context.user_data["contact_method"] = "phone"
     else:
         txt = (update.message.text or "").strip()
-
-        # если пользователь хочет связаться в TG
         if any(x in txt.lower() for x in ["телег", "сюда", "tg", "telegram"]):
             context.user_data["contact_method"] = "telegram"
             context.user_data["phone"] = ""
@@ -188,14 +243,12 @@ async def ask_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["phone"] = phone
             context.user_data["contact_method"] = "phone"
 
-    # сформировать лид
     user = update.effective_user
     lead_text = lead_to_text(user, context.user_data)
 
-    # лог в консоль Render
     logger.info("\n" + lead_text)
 
-    # отправка менеджеру (тебе)
+    # шлём лид тебе
     try:
         await context.bot.send_message(chat_id=int(MANAGER_CHAT_ID), text=lead_text)
     except Exception as e:
@@ -242,7 +295,6 @@ def main():
     app.add_handler(conv)
     app.add_handler(CommandHandler("ping", ping))
 
-    # polling (важно: должен быть только один запущенный экземпляр)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
