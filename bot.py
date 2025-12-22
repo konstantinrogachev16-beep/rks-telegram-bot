@@ -32,7 +32,6 @@ if not TOKEN:
 ADMIN_ID = int(os.getenv("ADMIN_ID", "327140660"))  # твой ID по умолчанию
 
 # ===================== SERVICES =====================
-# коды услуг
 S_TINT = "tint"
 S_POLISH = "polish"
 S_CERAMIC = "ceramic"
@@ -51,7 +50,7 @@ SERVICE_LABELS = {
     S_GLASS: "Шлифовка/полировка стекла",
 }
 
-SERVICE_ORDER = [  # порядок, как в меню
+SERVICE_ORDER = [
     S_TINT,
     S_POLISH,
     S_CERAMIC,
@@ -62,6 +61,7 @@ SERVICE_ORDER = [  # порядок, как в меню
 ]
 
 # ===================== STATES =====================
+# ВАЖНО: range(18) — с запасом, чтобы не ловить "too many values to unpack"
 (
     ASK_NAME,
     SELECT_SERVICES,
@@ -94,8 +94,7 @@ SERVICE_ORDER = [  # порядок, как в меню
     # finish
     ASK_TIME,
     ASK_CONTACT,
-) = range(16)
-
+) = range(18)
 
 # ===================== HELPERS =====================
 def normalize_phone(s: str) -> Optional[str]:
@@ -108,7 +107,6 @@ def normalize_phone(s: str) -> Optional[str]:
     if len(only_digits) < 10:
         return None
 
-    # РФ: 8XXXXXXXXXX -> +7XXXXXXXXXX
     if digits.startswith("8") and len(only_digits) == 11:
         return "+7" + only_digits[1:]
     if digits.startswith("+7") and len(only_digits) == 11:
@@ -116,7 +114,6 @@ def normalize_phone(s: str) -> Optional[str]:
     if digits.startswith("7") and len(only_digits) == 11:
         return "+7" + only_digits[-10:]
 
-    # если уже что-то похожее
     if digits.startswith("+") and len(only_digits) >= 11:
         return digits
 
@@ -124,7 +121,6 @@ def normalize_phone(s: str) -> Optional[str]:
 
 
 def ud_init(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Единая структура user_data."""
     if "details" not in context.user_data:
         context.user_data["details"] = {}
     if "services_selected" not in context.user_data:
@@ -181,12 +177,10 @@ def current_service(context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
 
 
 async def go_next_service(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Переходит к следующей услуге или к финальным вопросам."""
     ud_init(context)
-
     srv = current_service(context)
+
     if srv is None:
-        # услуг больше нет -> время
         await update.effective_message.reply_text(
             "Отлично 👍 Теперь подберём время.\nКогда удобно записаться?",
             reply_markup=ReplyKeyboardMarkup(
@@ -200,7 +194,6 @@ async def go_next_service(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return ASK_TIME
 
-    # Ветка по услуге
     if srv == S_TINT:
         context.user_data["tint_glass_selected"] = set()
         await update.effective_message.reply_text(
@@ -306,7 +299,6 @@ async def go_next_service(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return GLASS_WIPER
 
-    # если неизвестно
     context.user_data["service_index"] += 1
     return await go_next_service(update, context)
 
@@ -314,7 +306,6 @@ async def go_next_service(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # ===================== RENDER PORT "KOSTYL" =====================
 async def _http_handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     try:
-        # читаем хоть что-то, чтобы клиент не висел
         await reader.read(1024)
         resp = (
             b"HTTP/1.1 200 OK\r\n"
@@ -341,7 +332,6 @@ async def start_port_server():
 
 
 async def post_init(app: Application):
-    # Поднимаем порт-сервер для Render Web Service
     try:
         srv = await start_port_server()
         app.bot_data["port_server"] = srv
@@ -351,7 +341,6 @@ async def post_init(app: Application):
 
 # ===================== HANDLERS =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    ud_init(context)
     context.user_data.clear()
     ud_init(context)
 
@@ -408,7 +397,6 @@ async def services_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await q.answer("Выбери хотя бы одну услугу 🙂", show_alert=True)
             return SELECT_SERVICES
 
-        # фиксируем очередь
         queue = [c for c in SERVICE_ORDER if c in selected]
         context.user_data["services_queue"] = queue
         context.user_data["service_index"] = 0
@@ -450,7 +438,7 @@ async def tint_glass_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         await q.edit_message_reply_markup(
             reply_markup=kb_multi(
-                title_to_code={v: k for k, v in mapping.items()},  # инвертнули
+                title_to_code={v: k for k, v in mapping.items()},
                 selected_codes=selected,
                 done_cb="tint_glass_done",
                 reset_cb="tint_glass_reset",
@@ -480,26 +468,18 @@ async def tint_glass_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         context.user_data["details"].setdefault(S_TINT, {})
         context.user_data["details"][S_TINT]["glass"] = glass_titles
 
-        # Рекомендация по ходу
         rec_parts = []
         if "rear_half" in selected:
-            rec_parts.append("• Задняя полусфера — самый популярный вариант: салон меньше нагревается и комфортнее в городе.")
+            rec_parts.append("• Задняя полусфера — популярный вариант: меньше нагрев, больше комфорта.")
         if "windshield" in selected or "front_sides" in selected:
-            rec_parts.append("• Для лобового/передних боковых можно подобрать вариант «по ГОСТ», чтобы было спокойно на дороге.")
+            rec_parts.append("• Для лобового/передних боковых можно подобрать вариант «по ГОСТ», чтобы было спокойно.")
 
+        text = "🪟 *Тонировка*\nВыбрано: " + ", ".join(glass_titles)
         if rec_parts:
-            await q.edit_message_text(
-                "🪟 *Тонировка*\nВыбрано: " + ", ".join(glass_titles) + "\n\n" +
-                "*Подсказка:* \n" + "\n".join(rec_parts),
-                parse_mode="Markdown",
-            )
-        else:
-            await q.edit_message_text(
-                "🪟 *Тонировка*\nВыбрано: " + ", ".join(glass_titles),
-                parse_mode="Markdown",
-            )
+            text += "\n\n*Подсказка:*\n" + "\n".join(rec_parts)
 
-        # Если выбран лобовое или боковые перед — спрашиваем про легальность
+        await q.edit_message_text(text, parse_mode="Markdown")
+
         if ("windshield" in selected) or ("front_sides" in selected):
             await update.effective_message.reply_text(
                 "Нужна *легальная тонировка* (по ГОСТ) или *потемнее*?",
@@ -512,7 +492,6 @@ async def tint_glass_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             return TINT_LEGAL
 
-        # иначе сразу приоритет
         await update.effective_message.reply_text(
             "Что важнее?",
             reply_markup=ReplyKeyboardMarkup(
@@ -530,7 +509,6 @@ async def tint_legal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     ud_init(context)
     txt = (update.message.text or "").strip().lower()
 
-    legal = None
     if "гост" in txt or "да" in txt:
         legal = "ГОСТ"
     elif "нет" in txt or "темн" in txt:
@@ -542,11 +520,10 @@ async def tint_legal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["details"].setdefault(S_TINT, {})
     context.user_data["details"][S_TINT]["legal"] = legal
 
-    # рекомендация
     if legal == "ГОСТ":
-        await update.message.reply_text("Ок ✅ Подберём плёнку с высокой светопропускаемостью — безопасно и без вопросов.")
+        await update.message.reply_text("Ок ✅ Подберём плёнку с высокой светопропускаемостью — без вопросов.")
     else:
-        await update.message.reply_text("Понял 😎 Подберём вариант потемнее под твой стиль и комфорт.")
+        await update.message.reply_text("Понял 😎 Подберём вариант потемнее под стиль и комфорт.")
 
     await update.message.reply_text(
         "Что важнее?",
@@ -571,17 +548,15 @@ async def tint_priority(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     context.user_data["details"].setdefault(S_TINT, {})
     context.user_data["details"][S_TINT]["priority"] = txt
 
-    # мини-рекомендация по приоритету
     if txt == "Комфорт и тепло":
-        msg = "Отлично 👍 Тогда приоритет — плёнка, которая лучше держит тепло и солнечную нагрузку."
+        msg = "Отлично 👍 Тогда приоритет — плёнка, которая лучше держит тепло."
     elif txt == "Приватность":
-        msg = "Понял 👍 Сделаем акцент на приватность, чтобы в салоне было спокойнее."
+        msg = "Понял 👍 Сделаем акцент на приватность."
     else:
-        msg = "Ок 😎 Подберём максимально тёмный вариант в рамках выбранных стёкол."
+        msg = "Ок 😎 Подберём максимально тёмный вариант под выбранные стёкла."
 
     await update.message.reply_text(msg)
 
-    # завершили услугу -> следующая
     context.user_data["service_index"] += 1
     return await go_next_service(update, context)
 
@@ -607,7 +582,6 @@ async def polish_cond_click(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if code in selected:
             selected.remove(code)
         else:
-            # ограничим до 2 вариантов, чтобы не расплывалось
             if len(selected) >= 2:
                 await q.answer("Можно выбрать максимум 2 пункта 🙂", show_alert=True)
                 return POLISH_COND_MULTI
@@ -648,8 +622,7 @@ async def polish_cond_click(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data["details"][S_POLISH]["condition"] = picked
 
         await q.edit_message_text(
-            "✨ *Полировка кузова*\nПонял: " + ", ".join(picked) + "\n\n"
-            "Машина новая или уже не первый год?",
+            "✨ *Полировка кузова*\nПонял: " + ", ".join(picked) + "\n\nМашина новая или уже не первый год?",
             parse_mode="Markdown",
         )
 
@@ -678,8 +651,7 @@ async def polish_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["details"][S_POLISH]["age"] = txt
 
     await update.message.reply_text(
-        "Рекомендация ✅ Обычно в таком случае лучше всего подходит восстановительная полировка — "
-        "цвет становится глубже и уходит матовость."
+        "Рекомендация ✅ Обычно лучше всего подходит восстановительная полировка — цвет становится глубже."
     )
 
     context.user_data["service_index"] += 1
@@ -719,12 +691,11 @@ async def ceramic_goal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     context.user_data["details"].setdefault(S_CERAMIC, {})
     context.user_data["details"][S_CERAMIC]["goal"] = txt
 
-    # рекомендация
     polished_before = context.user_data["details"][S_CERAMIC].get("polished_before", "Нет")
     if polished_before == "Нет":
-        rec = "Керамика лучше всего работает после полировки — так эффект держится дольше."
+        rec = "Керамика лучше всего работает после полировки — эффект держится дольше."
     else:
-        rec = "Отлично 👍 Если полировка была недавно — керамика ляжет идеально и будет держаться дольше."
+        rec = "Если полировка была недавно — керамика ляжет идеально и будет держаться дольше."
     await update.message.reply_text(f"Рекомендация ✅ {rec}")
 
     context.user_data["service_index"] += 1
@@ -809,9 +780,7 @@ async def antirain_zone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     context.user_data["details"].setdefault(S_ANTIRAIN, {})
     context.user_data["details"][S_ANTIRAIN]["zone"] = txt
 
-    await update.message.reply_text(
-        "Рекомендация ✅ На лобовом эффект максимальный — вода уходит уже с 60–70 км/ч."
-    )
+    await update.message.reply_text("Рекомендация ✅ На лобовом эффект максимальный — вода уходит уже с 60–70 км/ч.")
 
     context.user_data["service_index"] += 1
     return await go_next_service(update, context)
@@ -829,9 +798,7 @@ async def headlight_state(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     context.user_data["details"].setdefault(S_HEADLIGHT, {})
     context.user_data["details"][S_HEADLIGHT]["state"] = txt
 
-    await update.message.reply_text(
-        "Рекомендация ✅ После полировки свет становится ярче, а внешний вид — свежее."
-    )
+    await update.message.reply_text("Рекомендация ✅ После полировки свет становится ярче, а внешний вид — свежее.")
 
     context.user_data["service_index"] += 1
     return await go_next_service(update, context)
@@ -849,9 +816,7 @@ async def glass_wiper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     context.user_data["details"].setdefault(S_GLASS, {})
     context.user_data["details"][S_GLASS]["wiper_scratches"] = txt
 
-    await update.message.reply_text(
-        "Рекомендация ✅ Если царапины неглубокие — можно восстановить без замены стекла."
-    )
+    await update.message.reply_text("Рекомендация ✅ Если царапины неглубокие — можно восстановить без замены стекла.")
 
     context.user_data["service_index"] += 1
     return await go_next_service(update, context)
@@ -869,7 +834,6 @@ async def ask_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if txt in {"Сегодня", "Завтра", "В выходные"}:
         context.user_data["time_pref"] = txt
     else:
-        # свободный ввод
         if len(txt) < 2:
             await update.message.reply_text("Напиши время чуть понятнее 🙂")
             return ASK_TIME
@@ -899,7 +863,6 @@ async def ask_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def ask_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     ud_init(context)
 
-    # контакт кнопкой
     if update.message.contact and update.message.contact.phone_number:
         phone = normalize_phone(update.message.contact.phone_number) or update.message.contact.phone_number
         context.user_data["contact_method"] = "phone"
@@ -924,7 +887,6 @@ async def ask_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             context.user_data["contact_method"] = "phone"
             context.user_data["phone"] = phone
 
-    # собираем лид
     user = update.effective_user
     username = f"@{user.username}" if user and user.username else "(нет username)"
 
@@ -946,7 +908,6 @@ async def ask_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         "— Детали —",
     ]
 
-    # форматируем детали по услугам
     for srv in services:
         srv_label = SERVICE_LABELS.get(srv, srv)
         srv_data = details.get(srv, {})
@@ -955,15 +916,11 @@ async def ask_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             lead_lines.append("  - (нет деталей)")
             continue
         for k, v in srv_data.items():
-            if isinstance(v, list):
-                v_str = ", ".join(v)
-            else:
-                v_str = str(v)
+            v_str = ", ".join(v) if isinstance(v, list) else str(v)
             lead_lines.append(f"  - {k}: {v_str}")
 
     lead_text = "\n".join(lead_lines)
 
-    # отправляем тебе
     await send_admin_lead(context.application, lead_text)
 
     await update.message.reply_text(
@@ -988,35 +945,26 @@ def main():
         entry_points=[CommandHandler("start", start)],
         states={
             ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_name)],
-
             SELECT_SERVICES: [CallbackQueryHandler(services_click)],
 
-            # tint
             TINT_GLASS_MULTI: [CallbackQueryHandler(tint_glass_click)],
             TINT_LEGAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, tint_legal)],
             TINT_PRIORITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, tint_priority)],
 
-            # polish
             POLISH_COND_MULTI: [CallbackQueryHandler(polish_cond_click)],
             POLISH_AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, polish_age)],
 
-            # ceramic
             CERAMIC_POLISHED: [MessageHandler(filters.TEXT & ~filters.COMMAND, ceramic_polished)],
             CERAMIC_GOAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, ceramic_goal)],
 
-            # waterstone
             WATER_ZONE_MULTI: [CallbackQueryHandler(water_zone_click)],
 
-            # antirain
             ANTIRAIN_ZONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, antirain_zone)],
 
-            # headlight
             HEADLIGHT_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, headlight_state)],
 
-            # glass polish
             GLASS_WIPER: [MessageHandler(filters.TEXT & ~filters.COMMAND, glass_wiper)],
 
-            # finish
             ASK_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_time)],
             ASK_CONTACT: [
                 MessageHandler(filters.CONTACT, ask_contact),
@@ -1028,10 +976,6 @@ def main():
     )
 
     app.add_handler(conv)
-
-    # ВАЖНО: polling (без webhook)
-    # Если ранее ставил webhook — удали:
-    # https://api.telegram.org/bot<TOKEN>/deleteWebhook
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
