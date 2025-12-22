@@ -1,5 +1,4 @@
 aiogram==3.3.0
-pydantic==2.10.3
 aiohttp==3.9.5
 python-dotenv==1.0.1
 flask==3.0.3
