@@ -1,55 +1,61 @@
-import os
 import asyncio
+import os
 import logging
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
-from aiogram.fsm.storage.memory import MemoryStorage
-
-from aiohttp import web
 
 logging.basicConfig(level=logging.INFO)
 
-TOKEN = os.getenv("BOT_TOKEN")
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN not set")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set")
 
-bot = Bot(token=TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
-
-
-@dp.message(CommandStart())
-async def start(message: types.Message):
-    await message.answer(
-        "Привет! Я задам пару вопросов, чтобы понять твою ситуацию и быть максимально полезным. "
-        "Займёт буквально пару минут, ок? 🙂"
-    )
+PORT = int(os.getenv("PORT", "10000"))  # Render задаёт PORT сам
 
 
-# --- маленький web-сервер для Render (чтобы порт был открыт) ---
-async def health(request: web.Request):
-    return web.Response(text="ok")
+async def start_bot_polling(dp: Dispatcher, bot: Bot):
+    # polling forever
+    await dp.start_polling(bot)
 
 
-async def run_web_server():
+def create_app() -> web.Application:
     app = web.Application()
+
+    async def health(request):
+        return web.Response(text="OK")
+
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
-
-    port = int(os.getenv("PORT", "10000"))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=port)
-    await site.start()
-    logging.info(f"HTTP server started on 0.0.0.0:{port}")
+    return app
 
 
 async def main():
-    # важно: polling + web server вместе
-    await bot.delete_webhook(drop_pending_updates=True)
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher()
 
-    await run_web_server()
-    await dp.start_polling(bot)
+    @dp.message(CommandStart())
+    async def start(message: types.Message):
+        await message.answer(
+            "Привет! Я задам пару вопросов, чтобы понять твою ситуацию и быть максимально полезным. "
+            "Займёт буквально пару минут, ок? 🙂"
+        )
+
+    # 1) запускаем polling в фоне
+    bot_task = asyncio.create_task(start_bot_polling(dp, bot))
+
+    # 2) поднимаем web-сервер, чтобы Render видел порт
+    app = create_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
+    await site.start()
+
+    logging.info(f"Web server started on 0.0.0.0:{PORT}")
+
+    # 3) ждём polling (он бесконечный)
+    await bot_task
 
 
 if __name__ == "__main__":
