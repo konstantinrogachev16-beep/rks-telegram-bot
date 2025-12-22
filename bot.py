@@ -174,6 +174,14 @@ async def ask_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id if update.effective_chat else ""
 
     lead_text = (
-        "🔥 <b>НОВЫЙ ЛИД</b>\n"
-        f"Имя: <b>{context.user_data.get('name','')}</b>\n"
-        f"TG: {username}\n"
+        lead_text = (
+    "🔥 <b>НОВЫЙ ЛИД</b>\n"
+    f"Имя: <b>{context.user_data.get('name','')}</b>\n"
+    f"TG: {username}\n"
+    f"UserID: <code>{user_id}</code>\n"
+    f"ChatID: <code>{chat_id}</code>\n\n"
+    f"Контекст: {context.user_data.get('context','')}\n"
+    f"Боль: {context.user_data.get('pain','')}\n"
+    f"Результат: {context.user_data.get('result','')}\n\n"
+    f"Контакт: <b>{context.user_data.get('phone','') or 'Telegram'}</b>\n"
+)
