@@ -182,6 +182,11 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TOKEN).build()
 
+    async def post_init(application):
+        await application.bot.delete_webhook(drop_pending_updates=True)
+
+    app.post_init = post_init
+
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -200,7 +205,3 @@ def main():
 
     app.add_handler(conv)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
-    main()
