@@ -1,5 +1,6 @@
 import os
 import re
+import logging
 from dotenv import load_dotenv
 
 from telegram import ReplyKeyboardMarkup, KeyboardButton, Update
@@ -12,13 +13,23 @@ from telegram.ext import (
     filters,
 )
 
-# --------- env ----------
-load_dotenv()  # читает .env локально (на Render не мешает)
+# ----------------- logging -----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("rks-bot")
+
+# ----------------- env -----------------
+load_dotenv()  # локально читает .env, на Render не мешает
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN not set")
 
-# --------- states ----------
+MANAGER_CHAT_ID = os.getenv("MANAGER_CHAT_ID", "327140660")  # по умолчанию твой ID
+
+
+# ----------------- states -----------------
 ASK_NAME, ASK_CONTEXT, ASK_PAIN, ASK_RESULT, ASK_CONTACT = range(5)
 
 
@@ -27,8 +38,8 @@ def normalize_phone(s: str) -> str | None:
         return None
     s = s.strip()
     digits = re.sub(r"[^\d+]", "", s)
-
     only_digits = re.sub(r"\D", "", digits)
+
     if len(only_digits) < 10:
         return None
 
@@ -43,7 +54,40 @@ def normalize_phone(s: str) -> str | None:
     return digits
 
 
-# --------- handlers ----------
+def lead_to_text(user, data: dict) -> str:
+    username = f"@{user.username}" if user and user.username else "(нет username)"
+    return (
+        "🔥 НОВЫЙ ЛИД\n"
+        f"Имя: {data.get('name','')}\n"
+        f"TG: {username}\n"
+        f"Контекст: {data.get('context','')}\n"
+        f"Боль: {data.get('pain','')}\n"
+        f"Результат: {data.get('result','')}\n"
+        f"Контакт: {data.get('phone','') or 'Telegram'}\n"
+    )
+
+
+def contact_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton("Отправить контакт ☎️", request_contact=True)],
+            [KeyboardButton("Написать номер текстом")],
+            [KeyboardButton("Оставлю Telegram, можно сюда")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def restart_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton("Пройти диагностику заново ✅")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+# ----------------- handlers -----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text(
@@ -55,12 +99,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = (update.message.text or "").strip()
-    if len(name) < 2:
+    text = (update.message.text or "").strip()
+
+    # быстрый перезапуск
+    if text.lower().startswith("пройти диагностику"):
+        return await start(update, context)
+
+    if len(text) < 2:
         await update.message.reply_text("Напиши имя чуть понятнее 🙂")
         return ASK_NAME
 
-    context.user_data["name"] = name
+    context.user_data["name"] = text
     await update.message.reply_text(
         "Отлично! Расскажи в двух словах про машину и ситуацию.\n"
         "Например: «Camry 2018, хочу освежить внешний вид / есть царапины / стекла в налёте»"
@@ -104,23 +153,13 @@ async def ask_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["result"] = txt
 
-    kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton("Отправить контакт ☎️", request_contact=True)],
-            [KeyboardButton("Написать номер текстом")],
-            [KeyboardButton("Оставлю Telegram, можно сюда")],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
-
     await update.message.reply_text(
         "Спасибо, картина ясна 👍\n\n"
         "Чтобы передать всё менеджеру и подобрать лучшее решение, оставь удобный контакт:\n"
         "• нажми «Отправить контакт»\n"
         "• или напиши номер текстом\n"
         "• или просто скажи «можно сюда в Telegram»",
-        reply_markup=kb,
+        reply_markup=contact_kb(),
     )
     return ASK_CONTACT
 
@@ -135,7 +174,7 @@ async def ask_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         txt = (update.message.text or "").strip()
 
         # если пользователь хочет связаться в TG
-        if "телег" in txt.lower() or "сюда" in txt.lower() or "tg" in txt.lower():
+        if any(x in txt.lower() for x in ["телег", "сюда", "tg", "telegram"]):
             context.user_data["contact_method"] = "telegram"
             context.user_data["phone"] = ""
         else:
@@ -149,26 +188,24 @@ async def ask_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["phone"] = phone
             context.user_data["contact_method"] = "phone"
 
-    # тут “передача менеджеру” — пока просто вывод в лог + подтверждение клиенту
+    # сформировать лид
     user = update.effective_user
-    username = f"@{user.username}" if user and user.username else "(нет username)"
+    lead_text = lead_to_text(user, context.user_data)
 
-    lead_text = (
-        "🔥 НОВЫЙ ЛИД\n"
-        f"Имя: {context.user_data.get('name','')}\n"
-        f"TG: {username}\n"
-        f"Контекст: {context.user_data.get('context','')}\n"
-        f"Боль: {context.user_data.get('pain','')}\n"
-        f"Результат: {context.user_data.get('result','')}\n"
-        f"Контакт: {context.user_data.get('phone','') or 'Telegram'}\n"
-    )
-    print(lead_text)
+    # лог в консоль Render
+    logger.info("\n" + lead_text)
+
+    # отправка менеджеру (тебе)
+    try:
+        await context.bot.send_message(chat_id=int(MANAGER_CHAT_ID), text=lead_text)
+    except Exception as e:
+        logger.exception("Failed to send lead to manager: %s", e)
 
     await update.message.reply_text(
         "✅ Принято! Я передал информацию менеджеру.\n"
         "Он свяжется с тобой в ближайшее время.\n\n"
         "Если хочешь — можешь прямо сейчас дописать любые детали (фото/видео тоже можно).",
-        reply_markup=None,
+        reply_markup=restart_kb(),
     )
     return ConversationHandler.END
 
@@ -177,6 +214,10 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("Ок, остановил. Если нужно — напиши /start 🙂")
     return ConversationHandler.END
+
+
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Я на связи. Напиши /start чтобы пройти мини-диагностику 🙂")
 
 
 def main():
@@ -199,6 +240,9 @@ def main():
     )
 
     app.add_handler(conv)
+    app.add_handler(CommandHandler("ping", ping))
+
+    # polling (важно: должен быть только один запущенный экземпляр)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
