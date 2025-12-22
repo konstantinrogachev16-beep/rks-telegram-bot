@@ -3,66 +3,190 @@ import re
 from datetime import datetime
 from dotenv import load_dotenv
 
-from telegram import ReplyKeyboardMarkup, KeyboardButton, Update
-from telegram.constants import ParseMode
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ConversationHandler,
     ContextTypes,
     filters,
 )
 
-# --------- env ----------
-load_dotenv()  # локально читает .env, на Render не мешает
+# =========================
+# ENV
+# =========================
+load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = os.getenv("ADMIN_ID")  # твой Telegram user id
+ADMIN_ID = int(os.getenv("ADMIN_ID", "327140660"))
+
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN not set")
-if not ADMIN_ID:
-    raise RuntimeError("ADMIN_ID not set")
-ADMIN_ID = int(ADMIN_ID)
 
-# --------- states ----------
-ASK_NAME, ASK_CONTEXT, ASK_PAIN, ASK_RESULT, ASK_CONTACT = range(5)
+# =========================
+# STATES
+# =========================
+(
+    ASK_NAME,
+    SERVICES_PICK,
+    ASK_CONTEXT,
+    ASK_PAIN,
+    ASK_RESULT,
+    QUIZ_BUDGET,
+    QUIZ_PRIORITY,
+    ASK_TIME,
+    ASK_CONTACT,
+) = range(9)
 
+# =========================
+# SERVICES (multi-select)
+# =========================
+SERVICES = [
+    ("tint", "Тонировка"),
+    ("polish", "Полировка кузова"),
+    ("ceramic", "Керамика (защита)"),
+    ("glass", "Удаление водного камня (стёкла)"),
+    ("anti_rain", "Антидождь"),
+    ("headlights", "Полировка фар"),
+    ("glass_polish", "Шлифовка/полировка стекла"),
+]
 
+# =========================
+# UTILS
+# =========================
 def normalize_phone(s: str) -> str | None:
     if not s:
         return None
     s = s.strip()
     digits = re.sub(r"[^\d+]", "", s)
-
     only_digits = re.sub(r"\D", "", digits)
     if len(only_digits) < 10:
         return None
 
-    # РФ: 8XXXXXXXXXX -> +7XXXXXXXXXX
+    # РФ приведение 8XXXXXXXXXX -> +7XXXXXXXXXX
     if digits.startswith("8") and len(only_digits) == 11:
-        digits = "+7" + only_digits[1:]
-    elif digits.startswith("7") and len(only_digits) == 11:
-        digits = "+7" + only_digits
-    elif digits.startswith("+7") and len(only_digits) == 11:
-        digits = "+7" + only_digits[-10:]
+        return "+7" + only_digits[1:]
+    if digits.startswith("7") and len(only_digits) == 11:
+        return "+7" + only_digits
+    if digits.startswith("+7") and len(only_digits) == 11:
+        return "+7" + only_digits[-10:]
 
+    # иначе оставим как есть, но проверим что длина ок
     return digits
 
 
-async def safe_send_admin(app: Application, text: str):
-    """Отправка админу с защитой от падений."""
+def safe_username(update: Update) -> str:
+    user = update.effective_user
+    if user and user.username:
+        return f"@{user.username}"
+    return "(нет username)"
+
+
+def services_keyboard(selected: set[str]) -> InlineKeyboardMarkup:
+    rows = []
+    for key, title in SERVICES:
+        mark = "✅ " if key in selected else "⬜ "
+        rows.append([InlineKeyboardButton(mark + title, callback_data=f"svc:{key}")])
+    rows.append(
+        [
+            InlineKeyboardButton("Готово ✅", callback_data="svc_done"),
+            InlineKeyboardButton("Сбросить ↩️", callback_data="svc_reset"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def build_recommendation(data: dict) -> str:
+    selected = data.get("services", set())
+    budget = data.get("budget", "")
+    priority = data.get("priority", "")
+
+    # Базовая логика рекомендаций
+    rec = []
+    if "glass" in selected:
+        rec.append("• По стёклам: удаление водного камня + (по желанию) антидождь для эффекта «как новое».")
+    if "anti_rain" in selected and "glass" not in selected:
+        rec.append("• Антидождь лучше наносить на чистое стекло — если есть налёт, сначала убираем водный камень.")
+    if "polish" in selected:
+        rec.append("• По кузову: полировка восстановит глубину цвета и уберёт мелкие царапины/матовость.")
+    if "ceramic" in selected:
+        rec.append("• Защита: керамика усилит блеск и упростит мойку, держит эффект дольше.")
+    if "tint" in selected:
+        rec.append("• Комфорт: тонировка снизит перегрев салона и улучшит приватность.")
+    if "headlights" in selected:
+        rec.append("• Фары: полировка улучшит свет и внешний вид (особенно если есть помутнение).")
+    if "glass_polish" in selected:
+        rec.append("• Стекло: шлифовка/полировка поможет при мелких царапинах (глубокие могут остаться частично).")
+
+    if not rec:
+        rec.append("• Под твою задачу можно собрать оптимальный комплекс (скажешь, что важнее — блеск/защита/стёкла/комфорт).")
+
+    # Уточнение по бюджету/приоритету (мягко, без лишних вопросов)
+    tail = []
+    if budget:
+        tail.append(f"Бюджет: {budget}.")
+    if priority:
+        tail.append(f"Приоритет: {priority}.")
+    tail_text = (" " + " ".join(tail)) if tail else ""
+
+    return "✅ Рекомендация (предварительно):\n" + "\n".join(rec) + (f"\n\n{tail_text}".strip() if tail_text else "")
+
+
+def parse_datetime_text(text: str) -> str | None:
+    """
+    Принимаем:
+    - 'сегодня 19:00' / 'завтра 12:30' (как текст — просто сохраним)
+    - '25.12 18:00'
+    - '25.12.2025 18:00'
+    - '25/12 18:00'
+    Валидация минимальная: должна быть дата и время HH:MM.
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+
+    if "сегодня" in t or "завтра" in t:
+        # обязательно наличие времени
+        if re.search(r"\b([01]\d|2[0-3]):[0-5]\d\b", t):
+            return text.strip()
+        return None
+
+    # дата + время
+    if re.search(r"\b(\d{1,2}[./]\d{1,2})([./]\d{2,4})?\s+([01]\d|2[0-3]):[0-5]\d\b", t):
+        return text.strip()
+
+    return None
+
+
+async def notify_admin(app: Application, admin_id: int, text: str):
     try:
-        await app.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode=ParseMode.HTML)
+        await app.bot.send_message(chat_id=admin_id, text=text)
     except Exception as e:
-        print("ADMIN SEND ERROR:", repr(e))
+        # Не падаем, просто печатаем
+        print("ADMIN SEND ERROR:", e)
+        print("LEAD TEXT:", text)
 
 
-# --------- handlers ----------
+# =========================
+# HANDLERS
+# =========================
+async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Я на связи. Напиши /start чтобы начать.")
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
+    context.user_data["services"] = set()
+
     await update.message.reply_text(
-        "Привет! Я задам пару вопросов, чтобы понять твою ситуацию и быть максимально полезным. "
-        "Займёт 1–2 минуты 🙂\n\n"
+        "Привет! Я помогу быстро подобрать услуги и записать тебя.\n\n"
         "Как тебя зовут?"
     )
     return ASK_NAME
@@ -75,11 +199,53 @@ async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ASK_NAME
 
     context.user_data["name"] = name
+
     await update.message.reply_text(
-        "Отлично! Расскажи в двух словах про машину и ситуацию.\n"
-        "Например: «Camry 2018, хочу освежить внешний вид / есть царапины / стекла в налёте»"
+        "Выбери услуги (можно несколько) и нажми «Готово ✅».",
+        reply_markup=services_keyboard(context.user_data["services"]),
     )
-    return ASK_CONTEXT
+    return SERVICES_PICK
+
+
+async def services_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data or ""
+    selected: set[str] = context.user_data.get("services", set())
+
+    if data.startswith("svc:"):
+        key = data.split(":", 1)[1]
+        if key in selected:
+            selected.remove(key)
+        else:
+            selected.add(key)
+        context.user_data["services"] = selected
+
+        await query.edit_message_text(
+            "Выбери услуги (можно несколько) и нажми «Готово ✅».",
+            reply_markup=services_keyboard(selected),
+        )
+        return SERVICES_PICK
+
+    if data == "svc_reset":
+        context.user_data["services"] = set()
+        await query.edit_message_text(
+            "Сбросил выбор. Выбери услуги и нажми «Готово ✅».",
+            reply_markup=services_keyboard(context.user_data["services"]),
+        )
+        return SERVICES_PICK
+
+    if data == "svc_done":
+        # Переходим в квиз
+        await query.edit_message_text(
+            "Ок 👍 Теперь короткий квиз, чтобы дать точную рекомендацию.\n\n"
+            "Расскажи в двух словах про машину и ситуацию.\n"
+            "Например: «Camry 2018, хочу освежить внешний вид / есть царапины / стекла в налёте»"
+        )
+        return ASK_CONTEXT
+
+    return SERVICES_PICK
 
 
 async def ask_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -90,8 +256,8 @@ async def ask_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["context"] = txt
     await update.message.reply_text(
-        "Понял. А что больше всего беспокоит прямо сейчас?\n"
-        "Что раздражает/мешает/не нравится?"
+        "Что больше всего беспокоит прямо сейчас? (1–2 предложения)\n"
+        "Например: «мелкие царапины», «матовый кузов», «налёт на стекле», «хочу приватность в салоне»"
     )
     return ASK_PAIN
 
@@ -104,7 +270,7 @@ async def ask_pain(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["pain"] = txt
     await update.message.reply_text(
-        "Ок. А какой результат хочешь получить в идеале?\n"
+        "Какой результат хочешь получить в идеале?\n"
         "Например: «чтобы блестела как новая», «чистые стёкла без налёта», «без мелких царапин»"
     )
     return ASK_RESULT
@@ -118,42 +284,117 @@ async def ask_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["result"] = txt
 
+    # Квиз: бюджет (кнопками)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            ["До 5 000", "5 000 – 10 000"],
+            ["10 000 – 20 000", "20 000+"],
+            ["Пока не знаю"],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await update.message.reply_text(
+        "Квиз (1/2): примерно какой бюджет планируешь?",
+        reply_markup=kb,
+    )
+    return QUIZ_BUDGET
+
+
+async def quiz_budget(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (update.message.text or "").strip()
+    if not txt:
+        await update.message.reply_text("Выбери вариант кнопкой 🙂")
+        return QUIZ_BUDGET
+
+    context.user_data["budget"] = txt
+
+    # Квиз: приоритет (кнопками)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            ["Максимальный блеск", "Защита надолго"],
+            ["Быстро и бюджетно", "Стёкла/видимость"],
+            ["Комфорт/приватность"],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await update.message.reply_text(
+        "Квиз (2/2): что важнее всего?",
+        reply_markup=kb,
+    )
+    return QUIZ_PRIORITY
+
+
+async def quiz_priority(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (update.message.text or "").strip()
+    if not txt:
+        await update.message.reply_text("Выбери вариант кнопкой 🙂")
+        return QUIZ_PRIORITY
+
+    context.user_data["priority"] = txt
+
+    # Показать рекомендацию
+    rec = build_recommendation(context.user_data)
+    await update.message.reply_text(rec, reply_markup=None)
+
+    # Запись по времени
+    await update.message.reply_text(
+        "Теперь давай запишем удобное время.\n\n"
+        "Напиши так, как удобно:\n"
+        "• «сегодня 19:00»\n"
+        "• «завтра 12:30»\n"
+        "• «25.12 18:00»"
+    )
+    return ASK_TIME
+
+
+async def ask_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (update.message.text or "").strip()
+    dt = parse_datetime_text(txt)
+    if not dt:
+        await update.message.reply_text(
+            "Не понял время 🙂\n"
+            "Примеры: «сегодня 19:00», «завтра 12:30», «25.12 18:00»"
+        )
+        return ASK_TIME
+
+    context.user_data["time"] = dt
+
     kb = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton("Отправить контакт ☎️", request_contact=True)],
-            [KeyboardButton("Написать номер текстом")],
-            [KeyboardButton("Оставлю Telegram, можно сюда")],
+            ["Написать номер текстом"],
+            ["Оставлю Telegram, можно сюда"],
         ],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
 
     await update.message.reply_text(
-        "Спасибо, картина ясна 👍\n\n"
-        "Чтобы передать всё менеджеру и подобрать лучшее решение, оставь удобный контакт:\n"
-        "• нажми «Отправить контакт»\n"
+        "Отлично 👍 Остался контакт для подтверждения записи:\n"
+        "• нажми «Отправить контакт ☎️»\n"
         "• или напиши номер текстом\n"
-        "• или просто скажи «можно сюда в Telegram»",
+        "• или скажи «можно сюда в Telegram»",
         reply_markup=kb,
     )
     return ASK_CONTACT
 
 
 async def ask_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 1) контакт кнопкой
+    # контакт кнопкой
     if update.message.contact and update.message.contact.phone_number:
         phone = normalize_phone(update.message.contact.phone_number) or update.message.contact.phone_number
         context.user_data["phone"] = phone
         context.user_data["contact_method"] = "phone"
     else:
         txt = (update.message.text or "").strip()
+        low = txt.lower()
 
-        # 2) если пользователь хочет связаться в TG
-        if any(w in txt.lower() for w in ["телег", "сюда", "tg", "telegram"]):
+        if "телег" in low or "сюда" in low or "tg" in low:
             context.user_data["contact_method"] = "telegram"
             context.user_data["phone"] = ""
         else:
-            # 3) номер текстом
             phone = normalize_phone(txt)
             if not phone:
                 await update.message.reply_text(
@@ -164,50 +405,36 @@ async def ask_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["phone"] = phone
             context.user_data["contact_method"] = "phone"
 
-    # --- сбор данных пользователя (ВАЖНО: именно тут, чтобы не было NameError) ---
-    user = update.effective_user
-    chat = update.effective_chat
-
-    username = f"@{user.username}" if (user and user.username) else "(нет username)"
-    user_id = user.id if user else "unknown"
-    chat_id = chat.id if chat else "unknown"
-
-    # --- текст лида ---
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    contact_value = context.user_data.get("phone", "") or "Telegram"
-    name = context.user_data.get("name", "")
-    ctx = context.user_data.get("context", "")
-    pain = context.user_data.get("pain", "")
-    res = context.user_data.get("result", "")
+    # Собираем лид
+    uname = safe_username(update)
+    selected = context.user_data.get("services", set())
+    selected_titles = [title for key, title in SERVICES if key in selected]
+    if not selected_titles:
+        selected_titles = ["(не выбрано)"]
 
     lead_text = (
-        "🔥 <b>НОВЫЙ ЛИД</b>\n"
-        f"🕒 {ts}\n"
-        "-----------------\n"
-        f"👤 Имя: <b>{name}</b>\n"
-        f"💬 TG: {username}\n"
-        f"🆔 UserID: <code>{user_id}</code>\n"
-        f"🧾 ChatID: <code>{chat_id}</code>\n\n"
-        f"🚗 Контекст: {ctx}\n"
-        f"😤 Боль: {pain}\n"
-        f"✅ Результат: {res}\n\n"
-        f"☎️ Контакт: <b>{contact_value}</b>\n"
+        "🔥 НОВЫЙ ЛИД\n"
+        f"Имя: {context.user_data.get('name','')}\n"
+        f"TG: {uname}\n"
+        f"Услуги: {', '.join(selected_titles)}\n"
+        f"Контекст: {context.user_data.get('context','')}\n"
+        f"Боль: {context.user_data.get('pain','')}\n"
+        f"Результат: {context.user_data.get('result','')}\n"
+        f"Квиз — бюджет: {context.user_data.get('budget','')}\n"
+        f"Квиз — приоритет: {context.user_data.get('priority','')}\n"
+        f"Время: {context.user_data.get('time','')}\n"
+        f"Контакт: {context.user_data.get('phone','') or 'Telegram'}\n"
     )
 
-    # 1) печать в лог Render
-    print(lead_text)
+    # Отправляем админу (тебе)
+    await notify_admin(context.application, ADMIN_ID, lead_text)
 
-    # 2) отправка тебе в Telegram
-    await safe_send_admin(context.application, lead_text)
-
-    # ответ клиенту
     await update.message.reply_text(
-        "✅ Принято! Я передал информацию менеджеру.\n"
-        "Он свяжется с тобой в ближайшее время.\n\n"
-        "Если хочешь — можешь дописать детали или отправить фото/видео.",
+        "✅ Готово! Я зафиксировал заявку и запись.\n"
+        "Менеджер свяжется с тобой для подтверждения.\n\n"
+        "Если хочешь — можешь прямо сейчас отправить фото/видео машины (я добавлю к заявке).",
         reply_markup=None,
     )
-
     return ConversationHandler.END
 
 
@@ -217,11 +444,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # быстрая команда для проверки что бот жив
-    await update.message.reply_text("✅ Я на связи. Напиши /start чтобы начать.")
-
-
 def main():
     app = Application.builder().token(TOKEN).build()
 
@@ -229,9 +451,13 @@ def main():
         entry_points=[CommandHandler("start", start)],
         states={
             ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_name)],
+            SERVICES_PICK: [CallbackQueryHandler(services_pick_callback)],
             ASK_CONTEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_context)],
             ASK_PAIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_pain)],
             ASK_RESULT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_result)],
+            QUIZ_BUDGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, quiz_budget)],
+            QUIZ_PRIORITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, quiz_priority)],
+            ASK_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_time)],
             ASK_CONTACT: [
                 MessageHandler(filters.CONTACT, ask_contact),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ask_contact),
@@ -241,10 +467,10 @@ def main():
         allow_reentry=True,
     )
 
-    app.add_handler(conv)
     app.add_handler(CommandHandler("health", health))
+    app.add_handler(conv)
 
-    # polling (важно: webhook должен быть удалён)
+    # polling (без вебхуков)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
