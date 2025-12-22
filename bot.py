@@ -1,22 +1,26 @@
-import re
-from datetime import datetime
-from typing import Optional, Set
 
+import os
+import asyncio
 from aiogram import Bot, Dispatcher, types
-from aiogram.utils import executor
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.dispatcher import FSMContext
-from aiogram.types import ReplyKeyboardRemove
+from aiogram.filters import CommandStart
+from aiogram.fsm.storage.memory import MemoryStorage
 
-from config import load_config
-from db import init_db, save_lead, add_manager, remove_manager, list_manager_ids
-from states import LeadForm, ManagerAuth
-from keyboards import (
-    start_kb, segments_kb, pains_kb, services_kb, ready_kb,
-    phone_request_kb, contact_method_kb,
-    SEGMENTS, PAINS, SERVICES, READY, CONTACT_METHODS
-)
+TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN not set")
 
+bot = Bot(token=TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+@dp.message(CommandStart())
+async def start(message: types.Message):
+    await message.answer("Привет! Я задам пару вопросов, чтобы понять твою ситуацию и быть максимально полезным. Займёт буквально пару минут, ок? 🙂")
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
 # --- helpers ---
 def code_to_text(code: str, mapping: list[tuple[str, str]]) -> str:
     for text, c in mapping:
