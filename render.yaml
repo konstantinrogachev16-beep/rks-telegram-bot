@@ -3,5 +3,6 @@ services:
     name: rks-telegram-bot
     env: python
     plan: free
-    buildCommand: python -m pip install --upgrade pip setuptools wheel && pip install -r requirements.txt
+    pythonVersion: 3.11.9
+    buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
