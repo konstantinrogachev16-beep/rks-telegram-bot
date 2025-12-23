@@ -286,39 +286,31 @@ def channel_kb() -> InlineKeyboardMarkup:
 
 # -------------------- UPSELLS --------------------
 def compute_upsells(user_data: dict) -> list[dict]:
-    """
-    Returns list of {title, reason} for manager and also used as tips for client.
-    No new questions.
-    """
     selected = set(user_data.get("services_selected", []))
     ans = user_data.get("services_answers", {})
 
     upsells: list[dict] = []
 
-    # 1) Полировка -> Керамика
     if "body_polish" in selected and "ceramic" not in selected:
         upsells.append({
             "title": "Керамика после полировки",
             "reason": "блеск и защита держатся заметно дольше",
         })
 
-    # 2) Водный камень -> Антидождь
     if "water_spots" in selected and "anti_rain" not in selected:
         upsells.append({
             "title": "Антидождь после удаления налёта",
             "reason": "вода меньше цепляется, стекло дольше чистое",
         })
 
-    # 3) Полировка стекла -> Антидождь (только если нет сколов)
     if "glass_polish" in selected and "anti_rain" not in selected:
-        chips = ans.get("glass_has_chips")  # "Да"/"Нет" or None
+        chips = ans.get("glass_has_chips")
         if chips != "Да":
             upsells.append({
                 "title": "Антидождь после полировки стекла",
                 "reason": "на отполированном стекле работает особенно эффективно",
             })
 
-    # 4) Химчистка (кожа) -> пропитка (если выбрана кожа, просто подсказка)
     if "interior" in selected:
         it = ans.get("interior_type")
         if it == "Чистка кожи + пропитка":
@@ -327,7 +319,6 @@ def compute_upsells(user_data: dict) -> list[dict]:
                 "reason": "дольше сохраняет мягкость и защищает от загрязнений",
             })
 
-    # ограничим подсказки клиенту до 2–3 (менеджеру можно все)
     return upsells
 
 
@@ -347,14 +338,6 @@ def format_upsells_for_manager(upsells: list[dict]) -> str:
 
 # -------------------- FLOW ENGINE --------------------
 def build_service_flow(selected_services: list[str]) -> list[dict]:
-    """
-    Step dict:
-      type: info | choice | yesno | toning_areas | toning_percent
-      key: store key into services_answers
-      text: prompt
-      options: for choice
-      kb_prefix: for yesno
-    """
     flow = []
     for svc in selected_services:
         label = SERVICE_LABEL.get(svc, svc)
@@ -472,7 +455,6 @@ def build_service_flow(selected_services: list[str]) -> list[dict]:
                 "text": f"**{label}**\nЕсть **сколы/трещины** на стекле?",
                 "kb_prefix": "glass_chips",
             })
-            # INFO shown only if chips == Да (handled in ask_next_flow_step)
             flow.append({
                 "type": "info",
                 "service": svc,
@@ -542,7 +524,8 @@ def toning_areas_kb(selected: set[str]) -> InlineKeyboardMarkup:
 
 def toning_percent_kb() -> InlineKeyboardMarkup:
     percents = ["2%", "5%", "15%", "20%", "35%", "Не знаю"]
-    return InlineKeyboardMarkup([[InlineKeyboardButton(p, callback_data=f"tp:{p}")]] for p in percents)
+    rows = [[InlineKeyboardButton(p, callback_data=f"tp:{p}")] for p in percents]
+    return InlineKeyboardMarkup(rows)
 
 
 # -------------------- CORE HANDLERS --------------------
@@ -646,7 +629,6 @@ async def ask_next_flow_step(message, context: ContextTypes.DEFAULT_TYPE):
     i = context.user_data.get("flow_i", 0)
 
     if i >= len(flow):
-        # ---- auto-upsells (client tips) BEFORE time question ----
         upsells = compute_upsells(context.user_data)
         tip = format_upsells_for_client(upsells, limit=3)
         if tip:
@@ -667,7 +649,6 @@ async def ask_next_flow_step(message, context: ContextTypes.DEFAULT_TYPE):
     text = step["text"]
 
     if stype == "info":
-        # show chips tip only if chips == Да
         if step["key"] == "glass_chips_tip":
             ans = context.user_data.get("services_answers", {}).get("glass_has_chips")
             if ans != "Да":
@@ -714,7 +695,6 @@ async def cb_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answers = context.user_data.setdefault("services_answers", {})
     data = q.data
 
-    # ---- toning areas (multi) ----
     if step["type"] == "toning_areas":
         sel: set[str] = context.user_data.get("toning_areas_set", set())
 
@@ -753,7 +733,6 @@ async def cb_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return S_SVC_FLOW
 
-    # ---- toning percent ----
     if step["type"] == "toning_percent":
         if data.startswith("tp:"):
             val = data.split(":", 1)[1]
@@ -763,7 +742,6 @@ async def cb_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await ask_next_flow_step(q.message, context)
         return S_SVC_FLOW
 
-    # ---- choice generic ----
     if step["type"] == "choice":
         prefix = f"ch:{step['key']}:"
         if data.startswith(prefix):
@@ -775,7 +753,6 @@ async def cb_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await ask_next_flow_step(q.message, context)
         return S_SVC_FLOW
 
-    # ---- yes/no generic ----
     if step["type"] == "yesno":
         pref = step["kb_prefix"] + ":"
         if data.startswith(pref):
@@ -823,7 +800,6 @@ async def on_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # contact button
     if update.message.contact and update.message.contact.phone_number:
         phone = normalize_phone(update.message.contact.phone_number)
         if not phone:
@@ -854,7 +830,6 @@ async def on_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_lead_to_manager(update, context)
 
-    # if glass chips -> reinforce for client
     glass_has_chips = context.user_data.get("services_answers", {}).get("glass_has_chips") == "Да"
     extra = ""
     if glass_has_chips:
@@ -990,7 +965,10 @@ def build_app() -> Application:
         states={
             S_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_name)],
             S_CAR: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_car)],
-            S_SERVICES: [CallbackQueryHandler(cb_services, pattern=r"^(svc:|svc_done|svc_reset)$")],
+
+            # ✅ FIX: pattern must match "svc:toning" etc., not only "svc:"
+            S_SERVICES: [CallbackQueryHandler(cb_services, pattern=r"^(svc:.*|svc_done|svc_reset)$")],
+
             S_SVC_FLOW: [CallbackQueryHandler(cb_flow)],
             S_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_time)],
             S_CONTACT: [
@@ -1035,3 +1013,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+```0
