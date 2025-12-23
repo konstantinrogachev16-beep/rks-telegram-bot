@@ -1,63 +1,53 @@
 import os
 import re
-import json
-import logging
-from datetime import datetime
-from typing import Dict, List, Set, Tuple, Optional
-
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 
 from telegram import (
     Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
-from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ConversationHandler,
     ContextTypes,
     filters,
 )
 
-# ===================== LOGGING =====================
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
-    level=logging.INFO,
-)
-log = logging.getLogger("rks_bot")
-
-# ===================== ENV =====================
+# ================== ENV ==================
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "327140660")
+
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN not set")
 
-# кому слать лиды
-OWNER_ID = int(os.getenv("OWNER_ID", "327140660"))
+# ================== Render port stub ==================
+def run_port_stub():
+    """Small HTTP server so Render Web Service detects an open port."""
+    port = int(os.getenv("PORT", "10000"))
 
-# ===================== STATES (NO UNPACK BUG) =====================
-_STATE_NAMES = [
-    "ASK_NAME",
-    "SELECT_SERVICES",
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"OK")
 
-    # tint branch
-    "TINT_GLASS_MULTI",
-    "TINT_LEGAL",
-    "TINT_PRIORITY",
+        def log_message(self, format, *args):
+            return
 
-    # finish
-    "ASK_TIME",
-    "ASK_CONTACT",
-]
-globals().update({name: i for i, name in enumerate(_STATE_NAMES)})
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    server.serve_forever()
 
-# ===================== HELPERS =====================
+# ================== Helpers ==================
 def normalize_phone(s: str) -> str | None:
     if not s:
         return None
@@ -67,33 +57,30 @@ def normalize_phone(s: str) -> str | None:
     if len(only_digits) < 10:
         return None
 
-    # РФ: 8XXXXXXXXXX -> +7XXXXXXXXXX
+    # RU: 8XXXXXXXXXX -> +7XXXXXXXXXX
     if digits.startswith("8") and len(only_digits) == 11:
-        digits = "+7" + only_digits[1:]
-    elif digits.startswith("7") and len(only_digits) == 11:
-        digits = "+7" + only_digits
-    elif digits.startswith("+7") and len(only_digits) == 11:
-        digits = "+7" + only_digits[-10:]
+        return "+7" + only_digits[1:]
+    if digits.startswith("7") and len(only_digits) == 11:
+        return "+7" + only_digits
+    if digits.startswith("+7") and len(only_digits) == 11:
+        return "+7" + only_digits[-10:]
+    # If already like +<country>...
+    if digits.startswith("+") and len(only_digits) >= 10:
+        return digits
 
     return digits
 
-def ud_get_set(context: ContextTypes.DEFAULT_TYPE, key: str) -> set:
-    val = context.user_data.get(key)
-    if isinstance(val, set):
-        return val
-    s = set()
-    context.user_data[key] = s
-    return s
+def safe_text(update: Update) -> str:
+    return (update.message.text or "").strip() if update.message else ""
 
-def pretty_services(services: Set[str]) -> str:
-    if not services:
-        return "—"
-    return "• " + "\n• ".join(sorted(services))
+# ================== Conversation states ==================
+ASK_NAME = 0
+PICK_SERVICES = 1
+TINT_PICK_ZONES = 2
+ASK_TIME = 3
+ASK_CONTACT = 4
 
-def now_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-# ===================== SERVICES UI =====================
+# ================== Services data ==================
 SERVICES = [
     "Тонировка",
     "Полировка кузова",
@@ -104,124 +91,49 @@ SERVICES = [
     "Шлифовка/полировка стекла",
 ]
 
-def services_keyboard(selected: Set[str]) -> InlineKeyboardMarkup:
+# callback keys
+CB_DONE = "done_services"
+CB_RESET = "reset_services"
+CB_SVC_PREFIX = "svc:"  # svc:<service_name>
+
+# tint zones
+TINT_ZONES = [
+    "Полусфера зад",
+    "Полусфера перед",
+    "Боковые задние",
+    "Боковые передние",
+    "Лобовое",
+    "Заднее",
+]
+CB_TINT_DONE = "done_tint"
+CB_TINT_RESET = "reset_tint"
+CB_TINT_PREFIX = "tint:"  # tint:<zone>
+
+# ================== UI builders ==================
+def build_services_keyboard(selected: set[str]) -> InlineKeyboardMarkup:
     rows = []
     for s in SERVICES:
         mark = "✅" if s in selected else "⬜️"
-        rows.append([InlineKeyboardButton(f"{mark} {s}", callback_data=f"svc:{s}")])
-    rows.append(
-        [
-            InlineKeyboardButton("Готово ✅", callback_data="svc:done"),
-            InlineKeyboardButton("Сбросить ↩️", callback_data="svc:reset"),
-        ]
-    )
+        rows.append([InlineKeyboardButton(f"{mark} {s}", callback_data=f"{CB_SVC_PREFIX}{s}")])
+    rows.append([
+        InlineKeyboardButton("Готово ✅", callback_data=CB_DONE),
+        InlineKeyboardButton("Сбросить ↩️", callback_data=CB_RESET),
+    ])
     return InlineKeyboardMarkup(rows)
 
-# ===================== TINT (MULTI) UI =====================
-TINT_GLASSES = [
-    "Полусфера зад (зад + 2 боковых зад)",
-    "Передние боковые",
-    "Задние боковые",
-    "Лобовое",
-    "Заднее стекло",
-]
-
-def tint_keyboard(selected: Set[str]) -> InlineKeyboardMarkup:
+def build_tint_keyboard(selected: set[str]) -> InlineKeyboardMarkup:
     rows = []
-    for g in TINT_GLASSES:
-        mark = "✅" if g in selected else "⬜️"
-        rows.append([InlineKeyboardButton(f"{mark} {g}", callback_data=f"tint:{g}")])
-    rows.append(
-        [
-            InlineKeyboardButton("Готово ✅", callback_data="tint:done"),
-            InlineKeyboardButton("Назад ◀️", callback_data="tint:back"),
-            InlineKeyboardButton("Сбросить ↩️", callback_data="tint:reset"),
-        ]
-    )
+    for z in TINT_ZONES:
+        mark = "✅" if z in selected else "⬜️"
+        rows.append([InlineKeyboardButton(f"{mark} {z}", callback_data=f"{CB_TINT_PREFIX}{z}")])
+    rows.append([
+        InlineKeyboardButton("Готово ✅", callback_data=CB_TINT_DONE),
+        InlineKeyboardButton("Сбросить ↩️", callback_data=CB_TINT_RESET),
+    ])
     return InlineKeyboardMarkup(rows)
 
-def tint_recommendation(glasses: Set[str]) -> str:
-    # короткие рекомендации "по ходу"
-    tips = []
-    if "Лобовое" in glasses:
-        tips.append("• Лобовое: обычно выбирают атермальную плёнку — меньше жарит солнце, видимость ок.")
-    if "Передние боковые" in glasses:
-        tips.append("• Передние боковые: важно помнить про требования закона по светопропусканию.")
-    if "Полусфера зад (зад + 2 боковых зад)" in glasses or "Заднее стекло" in glasses:
-        tips.append("• Задняя часть: комфортнее в салоне + меньше бликов ночью от фар сзади.")
-    if not tips:
-        tips.append("• Подберём плёнку под задачи: комфорт/приватность/законность.")
-    return "\n".join(tips)
-
-# ===================== FLOW HELPERS =====================
-def build_lead_text(context: ContextTypes.DEFAULT_TYPE, update: Update) -> str:
-    user = update.effective_user
-    username = f"@{user.username}" if user and user.username else "(нет username)"
-
-    services = context.user_data.get("services", set())
-    tint_glasses = context.user_data.get("tint_glasses", set())
-    tint_legal = context.user_data.get("tint_legal", "")
-    tint_priority = context.user_data.get("tint_priority", "")
-
-    contact_method = context.user_data.get("contact_method", "")
-    phone = context.user_data.get("phone", "")
-    time_pref = context.user_data.get("time_pref", "")
-
-    lines = [
-        "🔥 НОВЫЙ ЛИД",
-        f"Время: {now_str()}",
-        f"Имя: {context.user_data.get('name','')}",
-        f"TG: {username} | id={user.id if user else '—'}",
-        "",
-        "Услуги:",
-        pretty_services(services),
-    ]
-
-    if "Тонировка" in services:
-        lines += [
-            "",
-            "Тонировка:",
-            f"• Зоны: {', '.join(sorted(tint_glasses)) if tint_glasses else '—'}",
-            f"• Законность важна?: {tint_legal or '—'}",
-            f"• Приоритет: {tint_priority or '—'}",
-        ]
-
-    lines += [
-        "",
-        f"Время/дата: {time_pref or '—'}",
-        f"Контакт: {phone or 'Telegram'}",
-        f"Способ: {contact_method or '—'}",
-    ]
-
-    return "\n".join(lines)
-
-async def go_to_next_branch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Ветвление по выбранным услугам.
-    Сейчас реализуем детально только 'Тонировка' (Шаг 2).
-    Остальные пока пропускаем и идём к времени/контакту.
-    """
-    services: Set[str] = context.user_data.get("services", set())
-    context.user_data["branch_queue"] = [s for s in SERVICES if s in services]
-    return await run_next_branch(update, context)
-
-async def run_next_branch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    queue: List[str] = context.user_data.get("branch_queue", [])
-    while queue:
-        current = queue[0]
-        if current == "Тонировка":
-            await ask_tint_glasses(update, context)
-            return TINT_GLASS_MULTI
-        else:
-            # пока заглушка: пропускаем и идём дальше
-            queue.pop(0)
-            continue
-
-    # веток нет — идём дальше
-    return await ask_time(update, context)
-
-# ===================== HANDLERS =====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+# ================== Handlers ==================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text(
         "Привет! Я помогу быстро подобрать услуги и записать тебя.\n\n"
@@ -229,217 +141,116 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return ASK_NAME
 
-async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    name = (update.message.text or "").strip()
+async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = safe_text(update)
     if len(name) < 2:
         await update.message.reply_text("Напиши имя чуть понятнее 🙂")
         return ASK_NAME
 
     context.user_data["name"] = name
-    context.user_data["services"] = set()
+    context.user_data["services_selected"] = set()
 
+    kb = build_services_keyboard(context.user_data["services_selected"])
     await update.message.reply_text(
         "Выбери услуги (можно несколько) и нажми «Готово ✅».",
-        reply_markup=services_keyboard(context.user_data["services"]),
+        reply_markup=kb,
     )
-    return SELECT_SERVICES
+    return PICK_SERVICES
 
-async def services_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
+async def services_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-    data = q.data or ""
-    selected: Set[str] = context.user_data.get("services", set())
-    if not isinstance(selected, set):
-        selected = set()
-        context.user_data["services"] = selected
+    selected: set[str] = context.user_data.get("services_selected", set())
+    data = query.data or ""
 
-    if data == "svc:reset":
+    if data == CB_RESET:
         selected.clear()
-        await q.edit_message_reply_markup(reply_markup=services_keyboard(selected))
-        return SELECT_SERVICES
+        context.user_data["services_selected"] = selected
+        await query.edit_message_reply_markup(reply_markup=build_services_keyboard(selected))
+        return PICK_SERVICES
 
-    if data == "svc:done":
-        if not selected:
-            await q.answer("Выбери хотя бы 1 услугу 🙂", show_alert=True)
-            return SELECT_SERVICES
-
-        # переходим к ветвлению
-        await q.edit_message_text(
-            f"Принято 👍\n\nВыбрано:\n{pretty_services(selected)}",
-            reply_markup=None,
-        )
-        return await go_to_next_branch(update, context)
-
-    if data.startswith("svc:"):
-        svc = data.split("svc:", 1)[1]
+    if data.startswith(CB_SVC_PREFIX):
+        svc = data[len(CB_SVC_PREFIX):]
         if svc in selected:
             selected.remove(svc)
         else:
             selected.add(svc)
-        await q.edit_message_reply_markup(reply_markup=services_keyboard(selected))
-        return SELECT_SERVICES
+        context.user_data["services_selected"] = selected
+        await query.edit_message_reply_markup(reply_markup=build_services_keyboard(selected))
+        return PICK_SERVICES
 
-    return SELECT_SERVICES
-
-# -------- TINT BRANCH --------
-async def ask_tint_glasses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    selected = context.user_data.get("tint_glasses", set())
-    if not isinstance(selected, set):
-        selected = set()
-        context.user_data["tint_glasses"] = selected
-
-    text = (
-        "Тонировка: выбери что нужно (можно несколько) и нажми «Готово ✅».\n\n"
-        "Подсказка: «Полусфера зад» = заднее стекло + 2 задних боковых."
-    )
-
-    if update.callback_query:
-        await update.callback_query.message.reply_text(text, reply_markup=tint_keyboard(selected))
-    else:
-        await update.message.reply_text(text, reply_markup=tint_keyboard(selected))
-
-async def tint_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    data = q.data or ""
-
-    selected = context.user_data.get("tint_glasses", set())
-    if not isinstance(selected, set):
-        selected = set()
-        context.user_data["tint_glasses"] = selected
-
-    if data == "tint:reset":
-        selected.clear()
-        await q.edit_message_reply_markup(reply_markup=tint_keyboard(selected))
-        return TINT_GLASS_MULTI
-
-    if data == "tint:back":
-        # вернём на выбор услуг (по желанию)
-        await q.edit_message_text(
-            "Ок, вернул к выбору услуг. Выбери и нажми «Готово ✅».",
-            reply_markup=services_keyboard(context.user_data.get("services", set())),
-        )
-        return SELECT_SERVICES
-
-    if data == "tint:done":
+    if data == CB_DONE:
         if not selected:
-            await q.answer("Выбери хотя бы 1 пункт 🙂", show_alert=True)
-            return TINT_GLASS_MULTI
+            await query.answer("Нужно выбрать хотя бы одну услугу 🙂", show_alert=True)
+            return PICK_SERVICES
 
-        tips = tint_recommendation(selected)
-        await q.edit_message_text(
-            "Отлично. Вот рекомендации по выбранному:\n"
-            f"{tips}\n\n"
-            "Важно, чтобы было строго по закону?",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton("Да, строго по закону", callback_data="tlegal:yes"),
-                        InlineKeyboardButton("Главное комфорт/вид", callback_data="tlegal:no"),
-                    ]
-                ]
-            ),
+        # If tint is selected -> ask zones first
+        if "Тонировка" in selected:
+            context.user_data["tint_zones"] = set()
+            await query.message.reply_text(
+                "Тонировка ✅\nВыбери что нужно затонировать (можно несколько) и нажми «Готово ✅».",
+                reply_markup=build_tint_keyboard(context.user_data["tint_zones"]),
+            )
+            return TINT_PICK_ZONES
+
+        # otherwise go to time
+        await query.message.reply_text(
+            "Когда тебе удобно приехать? (пример: «завтра после 18:00», «в выходные утром»)"
         )
-        return TINT_LEGAL
+        return ASK_TIME
 
-    if data.startswith("tint:"):
-        val = data.split("tint:", 1)[1]
-        if val in selected:
-            selected.remove(val)
+    return PICK_SERVICES
+
+async def tint_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    selected: set[str] = context.user_data.get("tint_zones", set())
+    data = query.data or ""
+
+    if data == CB_TINT_RESET:
+        selected.clear()
+        context.user_data["tint_zones"] = selected
+        await query.edit_message_reply_markup(reply_markup=build_tint_keyboard(selected))
+        return TINT_PICK_ZONES
+
+    if data.startswith(CB_TINT_PREFIX):
+        zone = data[len(CB_TINT_PREFIX):]
+        if zone in selected:
+            selected.remove(zone)
         else:
-            selected.add(val)
-        await q.edit_message_reply_markup(reply_markup=tint_keyboard(selected))
-        return TINT_GLASS_MULTI
+            selected.add(zone)
+        context.user_data["tint_zones"] = selected
 
-    return TINT_GLASS_MULTI
+        # quick recommendations while selecting
+        # (short + useful, not spam)
+        if zone == "Лобовое":
+            await query.answer("Лобовое: можно атермальную плёнку — меньше жара и бликов.", show_alert=False)
 
-async def tint_legal_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    data = q.data or ""
+        await query.edit_message_reply_markup(reply_markup=build_tint_keyboard(selected))
+        return TINT_PICK_ZONES
 
-    if data == "tlegal:yes":
-        context.user_data["tint_legal"] = "Да"
-        hint = "Ок 👍 Тогда предложим варианты плёнки с упором на законность/видимость."
-    elif data == "tlegal:no":
-        context.user_data["tint_legal"] = "Не принципиально"
-        hint = "Понял 👍 Тогда подберём комфорт/приватность, расскажем плюсы/минусы."
-    else:
-        return TINT_LEGAL
+    if data == CB_TINT_DONE:
+        if not selected:
+            await query.answer("Выбери хотя бы одну зону 🙂", show_alert=True)
+            return TINT_PICK_ZONES
 
-    await q.edit_message_text(
-        f"{hint}\n\nЧто для тебя важнее?",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("Приватность", callback_data="tprio:privacy"),
-                    InlineKeyboardButton("Комфорт/жара", callback_data="tprio:comfort"),
-                ],
-                [
-                    InlineKeyboardButton("Внешний вид", callback_data="tprio:look"),
-                    InlineKeyboardButton("Не знаю, подберите", callback_data="tprio:help"),
-                ],
-            ]
-        ),
-    )
-    return TINT_PRIORITY
-
-async def tint_priority_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    data = q.data or ""
-
-    mapping = {
-        "tprio:privacy": "Приватность",
-        "tprio:comfort": "Комфорт/жара",
-        "tprio:look": "Внешний вид",
-        "tprio:help": "Подберите",
-    }
-    if data not in mapping:
-        return TINT_PRIORITY
-
-    context.user_data["tint_priority"] = mapping[data]
-
-    # ветка "Тонировка" завершена — убираем её из очереди
-    queue = context.user_data.get("branch_queue", [])
-    if queue and queue[0] == "Тонировка":
-        queue.pop(0)
-        context.user_data["branch_queue"] = queue
-
-    await q.edit_message_text(
-        "Отлично, принял ✅\n"
-        "Дальше уточню время и контакт, чтобы записать тебя.",
-        reply_markup=None,
-    )
-    return await run_next_branch(update, context)
-
-# -------- TIME --------
-async def ask_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    kb = ReplyKeyboardMarkup(
-        keyboard=[
-            ["Сегодня", "Завтра"],
-            ["На этой неделе", "На выходных"],
-            ["Пока не знаю"],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
-    if update.callback_query:
-        await update.callback_query.message.reply_text(
-            "Когда удобно приехать? (можно написать текстом: «среда после 18:00»)",
-            reply_markup=kb,
+        # After tint zones -> go to time
+        await query.message.reply_text(
+            "Отлично. Когда тебе удобно приехать? (пример: «завтра после 18:00», «в выходные утром»)"
         )
-    else:
-        await update.message.reply_text(
-            "Когда удобно приехать? (можно написать текстом: «среда после 18:00»)",
-            reply_markup=kb,
-        )
-    return ASK_TIME
+        return ASK_TIME
 
-async def got_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    txt = (update.message.text or "").strip()
-    context.user_data["time_pref"] = txt
+    return TINT_PICK_ZONES
+
+async def ask_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = safe_text(update)
+    if len(txt) < 3:
+        await update.message.reply_text("Напиши удобное время чуть подробнее 🙂")
+        return ASK_TIME
+
+    context.user_data["time"] = txt
 
     kb = ReplyKeyboardMarkup(
         keyboard=[
@@ -450,81 +261,113 @@ async def got_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         resize_keyboard=True,
         one_time_keyboard=True,
     )
+
     await update.message.reply_text(
-        "Чтобы подтвердить запись и уточнить детали — оставь контакт:",
+        "Чтобы подтвердить запись/уточнить детали — оставь контакт:\n"
+        "• нажми «Отправить контакт ☎️»\n"
+        "• или напиши номер текстом\n"
+        "• или просто скажи «можно сюда в Telegram»",
         reply_markup=kb,
     )
     return ASK_CONTACT
 
-# -------- CONTACT + SEND LEAD TO OWNER --------
-async def got_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.message.contact and update.message.contact.phone_number:
-        phone = normalize_phone(update.message.contact.phone_number) or update.message.contact.phone_number
-        context.user_data["phone"] = phone
-        context.user_data["contact_method"] = "phone"
-    else:
-        txt = (update.message.text or "").strip()
+async def ask_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    contact_method = "telegram"
+    phone = ""
 
-        if "телег" in txt.lower() or "сюда" in txt.lower() or "tg" in txt.lower():
-            context.user_data["contact_method"] = "telegram"
-            context.user_data["phone"] = ""
+    if update.message and update.message.contact and update.message.contact.phone_number:
+        phone = normalize_phone(update.message.contact.phone_number) or update.message.contact.phone_number
+        contact_method = "phone"
+    else:
+        txt = safe_text(update)
+        low = txt.lower()
+        if "телег" in low or "сюда" in low or "tg" in low:
+            contact_method = "telegram"
+            phone = ""
         else:
-            phone = normalize_phone(txt)
-            if not phone:
+            p = normalize_phone(txt)
+            if not p:
                 await update.message.reply_text(
                     "Не похоже на номер 🙂\n"
                     "Напиши в формате +7... или 8..., либо нажми «Отправить контакт ☎️»."
                 )
                 return ASK_CONTACT
-            context.user_data["phone"] = phone
-            context.user_data["contact_method"] = "phone"
+            contact_method = "phone"
+            phone = p
 
-    # сформировать лид
-    lead_text = build_lead_text(context, update)
+    context.user_data["contact_method"] = contact_method
+    context.user_data["phone"] = phone
 
-    # отправить владельцу
+    user = update.effective_user
+    username = f"@{user.username}" if user and user.username else "(нет username)"
+    tg_id = user.id if user else "?"
+
+    services_selected: set[str] = context.user_data.get("services_selected", set())
+    tint_zones: set[str] = context.user_data.get("tint_zones", set())
+
+    services_lines = []
+    for s in sorted(services_selected):
+        if s == "Тонировка" and tint_zones:
+            services_lines.append(f"• {s}: {', '.join(sorted(tint_zones))}")
+        else:
+            services_lines.append(f"• {s}")
+
+    lead_text = (
+        "🔥 НОВЫЙ ЛИД (RKS)\n"
+        f"Имя: {context.user_data.get('name','')}\n"
+        f"TG: {username}\n"
+        f"TG_ID: {tg_id}\n"
+        f"Услуги:\n" + ("\n".join(services_lines) if services_lines else "• (нет)") + "\n"
+        f"Время: {context.user_data.get('time','')}\n"
+        f"Контакт: {(phone if phone else 'Telegram')}\n"
+    )
+
+    # send to admin
     try:
-        await context.bot.send_message(
-            chat_id=OWNER_ID,
-            text=lead_text,
-        )
+        await context.bot.send_message(chat_id=int(ADMIN_CHAT_ID), text=lead_text)
     except Exception as e:
-        log.exception("Failed to send lead to owner: %s", e)
+        # still don't break user flow
+        print("ADMIN SEND ERROR:", e)
+        print(lead_text)
 
-    # ответ клиенту
     await update.message.reply_text(
-        "✅ Принято! Я передал информацию.\n"
-        "Скоро напишем/позвоним и подтвердим запись.\n\n"
+        "✅ Принято! Я отправил заявку.\n"
+        "Мы свяжемся с тобой в ближайшее время.\n\n"
         "Если хочешь — можешь дописать детали (фото/видео тоже можно).",
         reply_markup=None,
     )
     return ConversationHandler.END
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Ок, остановил. Если нужно — напиши /start 🙂")
+    if update.message:
+        await update.message.reply_text("Ок, остановил. Если нужно — напиши /start 🙂")
     return ConversationHandler.END
 
-# ===================== MAIN =====================
-def main() -> None:
-    app = Application.builder().token(TOKEN).build()
+async def on_startup(app: Application):
+    # Make sure webhook is not set (avoid webhook/polling mixing)
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=False)
+    except Exception as e:
+        print("delete_webhook error:", e)
+
+def main():
+    # Run port stub for Render Web Service
+    t = threading.Thread(target=run_port_stub, daemon=True)
+    t.start()
+
+    app = Application.builder().token(TOKEN).post_init(on_startup).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
             ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_name)],
-
-            SELECT_SERVICES: [CallbackQueryHandler(services_click, pattern=r"^svc:")],
-
-            TINT_GLASS_MULTI: [CallbackQueryHandler(tint_click, pattern=r"^tint:")],
-            TINT_LEGAL: [CallbackQueryHandler(tint_legal_click, pattern=r"^tlegal:")],
-            TINT_PRIORITY: [CallbackQueryHandler(tint_priority_click, pattern=r"^tprio:")],
-
-            ASK_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_time)],
-
+            PICK_SERVICES: [CallbackQueryHandler(services_callback)],
+            TINT_PICK_ZONES: [CallbackQueryHandler(tint_callback)],
+            ASK_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_time)],
             ASK_CONTACT: [
-                MessageHandler(filters.CONTACT, got_contact),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, got_contact),
+                MessageHandler(filters.CONTACT, ask_contact),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_contact),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
