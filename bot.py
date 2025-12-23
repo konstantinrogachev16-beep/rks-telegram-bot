@@ -3,7 +3,7 @@ import re
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 from telegram import (
@@ -40,7 +40,6 @@ if not TOKEN:
 MANAGER_CHAT_ID = int(os.getenv("MANAGER_CHAT_ID", "327140660"))
 PORT = int(os.getenv("PORT", "10000"))
 
-# Канал с работами
 WORKS_CHANNEL_URL = "https://t.me/+7nQ-MkqFk_BmZTZi"
 
 # ---------------- states ----------------
@@ -69,23 +68,191 @@ SERVICES = [
     (SVC_ENGINE, "Мойка мотора с консервацией"),
 ]
 
+# ---------------- translations (для менеджера) ----------------
+TINT_AREAS_RU = {
+    "rear_half": "Полусфера зад",
+    "front_half": "Полусфера перед",
+    "rear_sides": "Боковые зад",
+    "front_sides": "Боковые перед",
+    "windshield": "Лобовое",
+    "rear_glass": "Заднее",
+}
+YESNO_RU = {"yes": "Да", "no": "Нет", "unknown": "Не знаю/возможно"}
+
+POLISH_GOAL_RU = {
+    "shine": "Освежить блеск",
+    "micro_scratches": "Убрать мелкие царапины/паутинку",
+    "sale": "Под продажу",
+    "after_repair": "После покраски/ремонта",
+}
+POLISH_DAMAGE_RU = {"yes": "Да, есть", "no": "Нет, в основном мелкие", "unknown": "Не знаю/нужно посмотреть"}
+
+CERAMIC_GOAL_RU = {
+    "protect_shine": "Защита + блеск",
+    "hydro": "Гидрофоб (вода скатывается)",
+    "easy_wash": "Чтобы легче мыть",
+    "sale": "Под продажу / внешний вид",
+}
+CERAMIC_PAINT_RU = {
+    "new": "Почти новое",
+    "micro": "Есть паутинка/мелкие царапины",
+    "visible": "Есть заметные царапины/матовость",
+    "unknown": "Не знаю, нужно посмотреть",
+}
+
+WS_WHERE_RU = {"windshield": "Лобовое", "sides": "Боковые", "rear": "Заднее", "all": "Везде"}
+WS_LEVEL_RU = {"light": "Лёгкий", "medium": "Средний", "hard": "Сильный", "unknown": "Не знаю"}
+
+AR_WHERE_RU = {"windshield": "Лобовое", "all": "Все стёкла", "windshield_mirrors": "Лобовое + зеркала"}
+
+HL_STATE_RU = {"yellow": "Мутные/пожелтели", "scratches": "Царапины/затёртость", "refresh": "Просто освежить", "unknown": "Не знаю"}
+
+GP_WHERE_RU = {"windshield": "Лобовое", "side": "Боковое", "rear": "Заднее", "many": "Несколько/все"}
+GP_LEVEL_RU = {"light": "Мелкие царапины/дворники", "medium": "Средние царапины", "hard": "Сильные/глубокие/сколы", "unknown": "Не знаю"}
+
+INT_TYPE_RU = {"express": "Экспресс уборка", "full": "Полная химчистка", "leather": "Чистка кожи + пропитка"}
+INT_EXPRESS_RU = {"dust_mats": "Пыль/салон + коврики", "vac_plastic": "Пылесос + пластик", "fresh": "Быстро освежить"}
+INT_LEATHER_RU = {"seats": "Только сиденья", "seats_wheel": "Сиденья + руль", "all": "Весь кожаный салон"}
+INT_FULL_RU = {"stains": "Пятна/грязь", "smell": "Запах", "kids_pets": "Дети/животные", "like_new": "Сделать как новый"}
+
+ENG_REASON_RU = {"sale": "Под продажу", "dirty": "Убрать грязь/масляные следы", "care": "Профилактика/аккуратно", "unknown": "Не знаю"}
+ENG_CONS_RU = {"yes": "Да, с консервацией", "no": "Нет, только мойка", "unknown": "Не знаю — посоветовать"}
+
 # ---------------- helpers ----------------
-def normalize_phone(s: str) -> str | None:
+def normalize_phone_strict(s: str) -> str | None:
+    """
+    Строгая проверка телефона:
+    - 10..15 цифр
+    - если РФ и 11 цифр: 8XXXXXXXXXX / 7XXXXXXXXXX -> +7XXXXXXXXXX
+    - иначе если начинается с + и длина ок -> оставляем
+    """
     if not s:
         return None
     s = s.strip()
-    digits = re.sub(r"[^\d+]", "", s)
-    only_digits = re.sub(r"\D", "", digits)
-    if len(only_digits) < 10:
+    raw = re.sub(r"[^\d+]", "", s)
+    digits_only = re.sub(r"\D", "", raw)
+
+    if not (10 <= len(digits_only) <= 15):
         return None
 
-    if digits.startswith("8") and len(only_digits) == 11:
-        digits = "+7" + only_digits[1:]
-    elif digits.startswith("7") and len(only_digits) == 11:
-        digits = "+7" + only_digits
-    elif digits.startswith("+7") and len(only_digits) == 11:
-        digits = "+7" + only_digits[-10:]
-    return digits
+    # РФ приведение
+    if len(digits_only) == 11:
+        if digits_only.startswith("8"):
+            return "+7" + digits_only[1:]
+        if digits_only.startswith("7"):
+            return "+7" + digits_only[1:]
+        if raw.startswith("+7"):
+            return "+7" + digits_only[-10:]
+
+    # Международный
+    if raw.startswith("+"):
+        return "+" + digits_only
+
+    # Если без +, но длина ок — вернём как цифры (менеджеру можно перезвонить)
+    # но для РФ 10 цифр без кода страны — оставим как есть
+    return digits_only
+
+
+DATE_RE = re.compile(
+    r"^\s*(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?(?:\s+(\d{1,2}):(\d{2}))?\s*$"
+)
+
+def parse_when_to_dt(text: str) -> tuple[datetime | None, str | None]:
+    """
+    Принимает:
+    - сегодня / завтра / послезавтра (+ возможно время)
+    - ДД.ММ
+    - ДД.ММ.ГГГГ
+    - + опционально ЧЧ:ММ
+    Возвращает (dt, error)
+    """
+    if not text:
+        return None, "Пусто"
+
+    t = text.strip().lower()
+    now = datetime.now()
+
+    # запрет "вчера"
+    if "вчера" in t:
+        return None, "Нельзя выбрать прошедшее время 🙂"
+
+    # слова + время
+    def extract_time_from_text(s: str) -> tuple[int, int] | None:
+        m = re.search(r"(\d{1,2}):(\d{2})", s)
+        if not m:
+            return None
+        hh = int(m.group(1))
+        mm = int(m.group(2))
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return hh, mm
+        return None
+
+    hhmm = extract_time_from_text(t)
+
+    if "сегодня" in t:
+        dt = now.replace(second=0, microsecond=0)
+        if hhmm:
+            dt = dt.replace(hour=hhmm[0], minute=hhmm[1])
+        else:
+            dt = dt.replace(hour=12, minute=0)
+        return dt, None
+
+    if "завтра" in t:
+        base = now + timedelta(days=1)
+        dt = base.replace(second=0, microsecond=0)
+        if hhmm:
+            dt = dt.replace(hour=hhmm[0], minute=hhmm[1])
+        else:
+            dt = dt.replace(hour=12, minute=0)
+        return dt, None
+
+    if "послезавтра" in t:
+        base = now + timedelta(days=2)
+        dt = base.replace(second=0, microsecond=0)
+        if hhmm:
+            dt = dt.replace(hour=hhmm[0], minute=hhmm[1])
+        else:
+            dt = dt.replace(hour=12, minute=0)
+        return dt, None
+
+    # дата форматом
+    m = DATE_RE.match(text)
+    if not m:
+        # если не можем распарсить — разрешим как текст, но без проверки "в прошлом"
+        # здесь лучше мягко попросить формат, чтобы работал запрет прошлого
+        return None, "Напиши в формате: «сегодня 18:00» или «25.12 12:00» 🙂"
+
+    d = int(m.group(1))
+    mo = int(m.group(2))
+    y = m.group(3)
+    hh = m.group(4)
+    mm = m.group(5)
+
+    year = now.year
+    if y:
+        yy = int(y)
+        if yy < 100:
+            year = 2000 + yy
+        else:
+            year = yy
+
+    hour = int(hh) if hh is not None else 12
+    minute = int(mm) if mm is not None else 0
+
+    try:
+        dt = datetime(year, mo, d, hour, minute, 0, 0)
+    except ValueError:
+        return None, "Дата выглядит некорректно 🙂 Пример: 25.12 18:00"
+
+    # если ввели без года, но дата уже прошла — считаем, что имели в виду следующий год
+    if not y and dt.date() < now.date():
+        try:
+            dt2 = datetime(year + 1, mo, d, hour, minute, 0, 0)
+            dt = dt2
+        except ValueError:
+            pass
+
+    return dt, None
 
 
 def mark_selected(title: str, is_on: bool) -> str:
@@ -97,7 +264,6 @@ def build_services_kb(selected: list[str]) -> InlineKeyboardMarkup:
     for key, title in SERVICES:
         is_on = key in selected
         rows.append([InlineKeyboardButton(mark_selected(title, is_on), callback_data=f"svc|toggle|{key}")])
-
     rows.append(
         [
             InlineKeyboardButton("Готово ✅", callback_data="svc|done|_"),
@@ -200,7 +366,6 @@ def start_http_server():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     ensure_user_struct(context)
-
     await update.message.reply_text(
         "Привет! Я помогу быстро подобрать услуги и записать тебя 🙂\n\n"
         "Как тебя зовут?"
@@ -244,7 +409,6 @@ async def ask_car(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ASK_CAR
 
     context.user_data["car"] = car
-
     await update.message.reply_text(
         "Выбери услуги (можно несколько) и нажми «Готово ✅».",
         reply_markup=build_services_kb(context.user_data["selected_services"]),
@@ -292,7 +456,6 @@ async def services_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["service_queue"] = queue
 
         await q.edit_message_text("Отлично! Уточню пару моментов по выбранным услугам 👇")
-
         await maybe_send_recommendations(update, context)
         return await ask_next_service_question(update, context)
 
@@ -310,7 +473,6 @@ async def maybe_send_recommendations(update: Update, context: ContextTypes.DEFAU
             "💡 Если планируешь керамику — почти всегда лучше сначала сделать подготовку/лёгкую полировку. "
             "Так эффект заметно круче и держится дольше."
         )
-
     context.user_data["recommendations_sent"] = sent
 
 
@@ -327,12 +489,32 @@ def pop_service(context: ContextTypes.DEFAULT_TYPE):
     context.user_data["service_queue"] = q
 
 
+def kb_single(prefix: str, options: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text, callback_data=f"{prefix}|{val}")] for text, val in options]
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_multi(prefix: str, options: list[tuple[str, str]], selected: set[str], done_cb: str, reset_cb: str) -> InlineKeyboardMarkup:
+    rows = []
+    for text, val in options:
+        on = val in selected
+        rows.append([InlineKeyboardButton(("✅ " if on else "☐ ") + text, callback_data=f"{prefix}|toggle|{val}")])
+    rows.append(
+        [
+            InlineKeyboardButton("Готово ✅", callback_data=done_cb),
+            InlineKeyboardButton("Сбросить ↩️", callback_data=reset_cb),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
 async def ask_next_service_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user_struct(context)
     svc = current_service(context)
     if not svc:
         await update.effective_chat.send_message(
-            "Когда тебе удобно подъехать? Напиши день/время (например: «сегодня после 18:00» или «в пятницу 12:00»)."
+            "Когда тебе удобно подъехать?\n"
+            "Напиши: «сегодня 18:00» или «25.12 12:00» 🙂"
         )
         return ASK_TIME
 
@@ -359,33 +541,10 @@ async def ask_next_service_question(update: Update, context: ContextTypes.DEFAUL
     return await ask_next_service_question(update, context)
 
 
-def kb_single(prefix: str, options: list[tuple[str, str]]) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text, callback_data=f"{prefix}|{val}")] for text, val in options]
-    return InlineKeyboardMarkup(rows)
-
-
-def kb_multi(prefix: str, options: list[tuple[str, str]], selected: set[str], done_cb: str, reset_cb: str) -> InlineKeyboardMarkup:
-    rows = []
-    for text, val in options:
-        on = val in selected
-        rows.append([InlineKeyboardButton(("✅ " if on else "☐ ") + text, callback_data=f"{prefix}|toggle|{val}")])
-    rows.append(
-        [
-            InlineKeyboardButton("Готово ✅", callback_data=done_cb),
-            InlineKeyboardButton("Сбросить ↩️", callback_data=reset_cb),
-        ]
-    )
-    return InlineKeyboardMarkup(rows)
-
-
-# -------- TINT (обновлено: вопрос про старую плёнку) --------
+# -------- TINT --------
 async def tint_step_1(update: Update, context: ContextTypes.DEFAULT_TYPE):
     svc = SVC_TINT
-    context.user_data["flow_svc"] = svc
-    context.user_data["flow_step"] = "tint_area"
-
     selected = set(get_answer(context, svc, "areas", "").split(",")) if get_answer(context, svc, "areas") else set()
-
     options = [
         ("Полусфера зад", "rear_half"),
         ("Полусфера перед", "front_half"),
@@ -394,7 +553,6 @@ async def tint_step_1(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ("Лобовое", "windshield"),
         ("Заднее", "rear_glass"),
     ]
-
     await update.effective_chat.send_message(
         f"{svc_title(svc)}\nКакие стёкла тонируем? (можно несколько) 👇",
         reply_markup=kb_multi(
@@ -409,10 +567,6 @@ async def tint_step_1(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def tint_step_2(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    svc = SVC_TINT
-    context.user_data["flow_svc"] = svc
-    context.user_data["flow_step"] = "tint_percent"
-
     await update.effective_chat.send_message(
         "Какой процент плёнки хочешь? (чем меньше %, тем темнее)\n"
         "Если не знаешь — выбери «Не знаю» 🙂",
@@ -424,7 +578,7 @@ async def tint_step_2(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ("15%", "15"),
                 ("20%", "20"),
                 ("35%", "35"),
-                ("50%", "50"),
+                ("50%", "50%"),
                 ("Не знаю", "unknown"),
             ],
         ),
@@ -433,11 +587,6 @@ async def tint_step_2(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def tint_step_3(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # НОВОЕ: старая плёнка
-    svc = SVC_TINT
-    context.user_data["flow_svc"] = svc
-    context.user_data["flow_step"] = "tint_old_film"
-
     await update.effective_chat.send_message(
         "Есть старая плёнка, которую нужно снять перед тонировкой?",
         reply_markup=kb_single(
@@ -454,9 +603,8 @@ async def tint_step_3(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # -------- BODY POLISH --------
 async def body_polish_step_1(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    svc = SVC_BODY_POLISH
     await update.effective_chat.send_message(
-        f"{svc_title(svc)}\nКакая цель полировки?",
+        f"{svc_title(SVC_BODY_POLISH)}\nКакая цель полировки?",
         reply_markup=kb_single(
             "polish|goal",
             [
@@ -733,7 +881,6 @@ async def steps_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 current.remove(val)
             else:
                 current.add(val)
-
             add_answer(context, svc, "areas", ",".join(sorted(current)))
 
             options = [
@@ -789,127 +936,127 @@ async def steps_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return parts[2]
         return None
 
-    # tint percent -> next old film
-    val = handle_single("tint|percent")
-    if val is not None:
-        add_answer(context, SVC_TINT, "percent", val)
+    # tint percent -> old film
+    v = handle_single("tint|percent")
+    if v is not None:
+        add_answer(context, SVC_TINT, "percent", v)
         await q.message.reply_text("Ок ✅")
         return await tint_step_3(update, context)
 
     # tint old film -> finish tint
-    val = handle_single("tint|old")
-    if val is not None:
-        add_answer(context, SVC_TINT, "old_film", val)
+    v = handle_single("tint|old")
+    if v is not None:
+        add_answer(context, SVC_TINT, "old_film", v)
         await q.message.reply_text("Принял ✅")
         pop_service(context)
         return await ask_next_service_question(update, context)
 
     # polish
-    val = handle_single("polish|goal")
-    if val is not None:
-        add_answer(context, SVC_BODY_POLISH, "goal", val)
+    v = handle_single("polish|goal")
+    if v is not None:
+        add_answer(context, SVC_BODY_POLISH, "goal", v)
         if SVC_CERAMIC in context.user_data.get("selected_services", []):
             await q.message.reply_text("💡 Совет: перед керамикой полировка/подготовка почти всегда даёт лучший эффект.")
         return await body_polish_step_2(update, context)
 
-    val = handle_single("polish|damage")
-    if val is not None:
-        add_answer(context, SVC_BODY_POLISH, "damage", val)
+    v = handle_single("polish|damage")
+    if v is not None:
+        add_answer(context, SVC_BODY_POLISH, "damage", v)
         await q.message.reply_text("Принял ✅")
         pop_service(context)
         return await ask_next_service_question(update, context)
 
     # ceramic
-    val = handle_single("ceramic|goal")
-    if val is not None:
-        add_answer(context, SVC_CERAMIC, "goal", val)
+    v = handle_single("ceramic|goal")
+    if v is not None:
+        add_answer(context, SVC_CERAMIC, "goal", v)
         return await ceramic_step_2(update, context)
 
-    val = handle_single("ceramic|paint")
-    if val is not None:
-        add_answer(context, SVC_CERAMIC, "paint", val)
+    v = handle_single("ceramic|paint")
+    if v is not None:
+        add_answer(context, SVC_CERAMIC, "paint", v)
         await q.message.reply_text("Ок ✅")
         pop_service(context)
         return await ask_next_service_question(update, context)
 
     # waterspot
-    val = handle_single("ws|where")
-    if val is not None:
-        add_answer(context, SVC_WATERSPOT, "where", val)
+    v = handle_single("ws|where")
+    if v is not None:
+        add_answer(context, SVC_WATERSPOT, "where", v)
         return await waterspot_step_2(update, context)
 
-    val = handle_single("ws|level")
-    if val is not None:
-        add_answer(context, SVC_WATERSPOT, "level", val)
+    v = handle_single("ws|level")
+    if v is not None:
+        add_answer(context, SVC_WATERSPOT, "level", v)
         await q.message.reply_text("Принял ✅")
         pop_service(context)
         return await ask_next_service_question(update, context)
 
     # anti-rain
-    val = handle_single("ar|where")
-    if val is not None:
-        add_answer(context, SVC_ANTI_RAIN, "where", val)
+    v = handle_single("ar|where")
+    if v is not None:
+        add_answer(context, SVC_ANTI_RAIN, "where", v)
         await q.message.reply_text("Ок ✅")
         pop_service(context)
         return await ask_next_service_question(update, context)
 
     # headlight
-    val = handle_single("hl|state")
-    if val is not None:
-        add_answer(context, SVC_HEADLIGHT, "state", val)
+    v = handle_single("hl|state")
+    if v is not None:
+        add_answer(context, SVC_HEADLIGHT, "state", v)
         await q.message.reply_text("Принял ✅")
         pop_service(context)
         return await ask_next_service_question(update, context)
 
     # glass polish
-    val = handle_single("gp|where")
-    if val is not None:
-        add_answer(context, SVC_GLASS_POLISH, "where", val)
+    v = handle_single("gp|where")
+    if v is not None:
+        add_answer(context, SVC_GLASS_POLISH, "where", v)
         return await glass_polish_step_2(update, context)
 
-    val = handle_single("gp|level")
-    if val is not None:
-        add_answer(context, SVC_GLASS_POLISH, "level", val)
+    v = handle_single("gp|level")
+    if v is not None:
+        add_answer(context, SVC_GLASS_POLISH, "level", v)
         await q.message.reply_text("Ок ✅")
         pop_service(context)
         return await ask_next_service_question(update, context)
 
     # interior
-    val = handle_single("int|type")
-    if val is not None:
-        add_answer(context, SVC_INTERIOR, "type", val)
+    v = handle_single("int|type")
+    if v is not None:
+        add_answer(context, SVC_INTERIOR, "type", v)
         return await interior_step_2(update, context)
 
-    val = handle_single("int|express")
-    if val is not None:
-        add_answer(context, SVC_INTERIOR, "express_focus", val)
+    v = handle_single("int|express")
+    if v is not None:
+        add_answer(context, SVC_INTERIOR, "express_focus", v)
         await q.message.reply_text("Принял ✅")
         pop_service(context)
         return await ask_next_service_question(update, context)
 
-    val = handle_single("int|leather")
-    if val is not None:
-        add_answer(context, SVC_INTERIOR, "leather_where", val)
+    v = handle_single("int|leather")
+    if v is not None:
+        add_answer(context, SVC_INTERIOR, "leather_where", v)
         await q.message.reply_text("Ок ✅")
         pop_service(context)
         return await ask_next_service_question(update, context)
 
-    val = handle_single("int|full")
-    if val is not None:
-        add_answer(context, SVC_INTERIOR, "full_issue", val)
+    v = handle_single("int|full")
+    if v is not None:
+        add_answer(context, SVC_INTERIOR, "full_issue", v)
         await q.message.reply_text("Принял ✅")
         pop_service(context)
         return await ask_next_service_question(update, context)
 
     # engine
-    val = handle_single("eng|reason")
-    if val is not None:
-        add_answer(context, SVC_ENGINE, "reason", val)
+    v = handle_single("eng|reason")
+    if v is not None:
+        add_answer(context, SVC_ENGINE, "reason", v)
         return await engine_step_2(update, context)
 
-    val = handle_single("eng|cons")
-    if val is not None:
-        add_answer(context, SVC_ENGINE, "conserve", val)
+    v = handle_single("eng|cons")
+    if v is not None:
+        add_answer(context, SVC_ENGINE, "conserve", v)
         await q.message.reply_text("Ок ✅")
         pop_service(context)
         return await ask_next_service_question(update, context)
@@ -917,14 +1064,25 @@ async def steps_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return SERVICE_FLOW
 
 
-# ---------------- time -> contact ----------------
+# ---------------- time (запрет прошлого) ----------------
 async def ask_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
-    if len(txt) < 2:
-        await update.message.reply_text("Напиши удобное время чуть точнее 🙂")
+    dt, err = parse_when_to_dt(txt)
+    if err:
+        await update.message.reply_text(err)
         return ASK_TIME
 
+    now = datetime.now()
+    if dt is not None and dt < now:
+        await update.message.reply_text("Это время уже прошло 🙂 Напиши другое: «сегодня 18:00» или «25.12 12:00».")
+        return ASK_TIME
+
+    # сохраняем исходный текст + нормализованную дату (для менеджера можно вывести красивее)
     context.user_data["preferred_time"] = txt
+    if dt is not None:
+        context.user_data["preferred_time_dt"] = dt.isoformat()
+    else:
+        context.user_data["preferred_time_dt"] = ""
 
     kb = ReplyKeyboardMarkup(
         keyboard=[
@@ -946,63 +1104,150 @@ async def ask_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_CONTACT
 
 
-# ---------------- contact -> send lead ----------------
+# ---------------- contact (строгая проверка) ----------------
 async def ask_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = ""
     contact_method = "telegram"
 
     if update.message.contact and update.message.contact.phone_number:
-        phone = normalize_phone(update.message.contact.phone_number) or update.message.contact.phone_number
+        phone_norm = normalize_phone_strict(update.message.contact.phone_number)
+        if not phone_norm:
+            await update.message.reply_text("Контакт пришёл некорректным 😕 Попробуй написать номер текстом: +7XXXXXXXXXX")
+            return ASK_CONTACT
+        phone = phone_norm
         contact_method = "phone"
     else:
         txt = (update.message.text or "").strip()
-        if "телег" in txt.lower() or "сюда" in txt.lower() or "tg" in txt.lower():
+        low = txt.lower()
+
+        if "телег" in low or "сюда" in low or "tg" in low:
             contact_method = "telegram"
             phone = ""
         else:
-            p = normalize_phone(txt)
-            if not p:
+            phone_norm = normalize_phone_strict(txt)
+            if not phone_norm:
                 await update.message.reply_text(
-                    "Не похоже на номер 🙂\n"
-                    "Напиши в формате +7... или 8..., либо нажми «Отправить контакт ☎️»."
+                    "Номер некорректный 🙂\n"
+                    "Напиши в формате +7XXXXXXXXXX или 8XXXXXXXXXX (10–15 цифр)."
                 )
                 return ASK_CONTACT
-            phone = p
+            phone = phone_norm
             contact_method = "phone"
 
     context.user_data["phone"] = phone
     context.user_data["contact_method"] = contact_method
 
+    # --- сбор лида ---
     user = update.effective_user
-    username = f"@{user.username}" if user and user.username else "(нет username)"
+    username = user.username if user and user.username else ""
+    tg_line = f"*Telegram:* @{username}\n" if username else ""
+
     name = context.user_data.get("name", "")
     car = context.user_data.get("car", "—")
     preferred_time = context.user_data.get("preferred_time", "")
+
     selected = context.user_data.get("selected_services", [])
     answers = context.user_data.get("service_answers", {})
 
     temp, why = lead_temperature(context)
 
+    # --- формируем услуги на русском ---
     lines = []
     for svc in selected:
-        svc_lines = [f"• {svc_title(svc)}"]
+        svc_lines = [f"• *{svc_title(svc)}*"]
         a = answers.get(svc, {})
-        if a:
-            for k, v in a.items():
-                if not v:
-                    continue
-                svc_lines.append(f"   - {k}: {v}")
+
+        if svc == SVC_TINT:
+            areas = a.get("areas", "")
+            percent = a.get("percent", "")
+            old = a.get("old_film", "")
+
+            if areas:
+                area_list = [TINT_AREAS_RU.get(x, x) for x in areas.split(",") if x]
+                svc_lines.append(f"   - Стёкла: {', '.join(area_list)}")
+            if percent:
+                svc_lines.append(f"   - Процент: {('Не знаю' if percent == 'unknown' else str(percent).replace('%','') + '%')}")
+            if old:
+                svc_lines.append(f"   - Старая плёнка: {YESNO_RU.get(old, old)}")
+
+        elif svc == SVC_BODY_POLISH:
+            goal = a.get("goal", "")
+            dmg = a.get("damage", "")
+            if goal:
+                svc_lines.append(f"   - Цель: {POLISH_GOAL_RU.get(goal, goal)}")
+            if dmg:
+                svc_lines.append(f"   - Глубокие дефекты: {POLISH_DAMAGE_RU.get(dmg, dmg)}")
+
+        elif svc == SVC_CERAMIC:
+            goal = a.get("goal", "")
+            paint = a.get("paint", "")
+            if goal:
+                svc_lines.append(f"   - Цель: {CERAMIC_GOAL_RU.get(goal, goal)}")
+            if paint:
+                svc_lines.append(f"   - ЛКП: {CERAMIC_PAINT_RU.get(paint, paint)}")
+
+        elif svc == SVC_WATERSPOT:
+            wh = a.get("where", "")
+            lvl = a.get("level", "")
+            if wh:
+                svc_lines.append(f"   - Где: {WS_WHERE_RU.get(wh, wh)}")
+            if lvl:
+                svc_lines.append(f"   - Налёт: {WS_LEVEL_RU.get(lvl, lvl)}")
+
+        elif svc == SVC_ANTI_RAIN:
+            wh = a.get("where", "")
+            if wh:
+                svc_lines.append(f"   - Куда: {AR_WHERE_RU.get(wh, wh)}")
+
+        elif svc == SVC_HEADLIGHT:
+            st = a.get("state", "")
+            if st:
+                svc_lines.append(f"   - Состояние: {HL_STATE_RU.get(st, st)}")
+
+        elif svc == SVC_GLASS_POLISH:
+            wh = a.get("where", "")
+            lvl = a.get("level", "")
+            if wh:
+                svc_lines.append(f"   - Стекло: {GP_WHERE_RU.get(wh, wh)}")
+            if lvl:
+                svc_lines.append(f"   - Дефекты: {GP_LEVEL_RU.get(lvl, lvl)}")
+
+        elif svc == SVC_INTERIOR:
+            t = a.get("type", "")
+            if t:
+                svc_lines.append(f"   - Формат: {INT_TYPE_RU.get(t, t)}")
+                if t == "express":
+                    ef = a.get("express_focus", "")
+                    if ef:
+                        svc_lines.append(f"   - Упор: {INT_EXPRESS_RU.get(ef, ef)}")
+                elif t == "leather":
+                    lw = a.get("leather_where", "")
+                    if lw:
+                        svc_lines.append(f"   - Кожа: {INT_LEATHER_RU.get(lw, lw)}")
+                elif t == "full":
+                    fi = a.get("full_issue", "")
+                    if fi:
+                        svc_lines.append(f"   - Проблема: {INT_FULL_RU.get(fi, fi)}")
+
+        elif svc == SVC_ENGINE:
+            r = a.get("reason", "")
+            c = a.get("conserve", "")
+            if r:
+                svc_lines.append(f"   - Зачем: {ENG_REASON_RU.get(r, r)}")
+            if c:
+                svc_lines.append(f"   - Консервация: {ENG_CONS_RU.get(c, c)}")
+
         lines.append("\n".join(svc_lines))
 
     lead_text = (
         "🔥 *НОВЫЙ ЛИД*\n"
         f"*Температура:* {temp}\n"
         f"*Почему:* {why}\n"
-        f"*Время:* {now_str()}\n\n"
+        f"*Время заявки:* {now_str()}\n\n"
         f"*Имя:* {name}\n"
         f"*Автомобиль:* {car}\n"
-        f"*TG:* {username}\n\n"
-        f"*Услуги:*\n" + ("\n".join(lines) if lines else "—") + "\n\n"
+        + tg_line +
+        "\n*Услуги:*\n" + ("\n".join(lines) if lines else "—") + "\n\n"
         f"*Когда удобно:* {preferred_time}\n"
         f"*Контакт:* {(phone if phone else 'Telegram')}\n"
     )
@@ -1023,7 +1268,6 @@ async def ask_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         resize_keyboard=True,
         one_time_keyboard=True,
     )
-
     channel_kb = InlineKeyboardMarkup(
         [[InlineKeyboardButton("Смотреть наши работы 🔥", url=WORKS_CHANNEL_URL)]]
     )
