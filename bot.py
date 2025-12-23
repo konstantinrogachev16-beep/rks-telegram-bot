@@ -1,54 +1,56 @@
 import os
 import re
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import logging
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple, Any
+
 from dotenv import load_dotenv
 
 from telegram import (
     Update,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
 from telegram.ext import (
     Application,
-    CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    CommandHandler,
     ConversationHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
-# ================== ENV ==================
+# ----------------- env -----------------
 load_dotenv()
-TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "327140660")
 
-if not TOKEN:
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN not set")
 
-# ================== Render port stub ==================
-def run_port_stub():
-    """Small HTTP server so Render Web Service detects an open port."""
-    port = int(os.getenv("PORT", "10000"))
+WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").strip()
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/tg").strip() or "/tg"
+if not WEBHOOK_PATH.startswith("/"):
+    WEBHOOK_PATH = "/" + WEBHOOK_PATH
 
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header("Content-type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(b"OK")
+OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "327140660"))
 
-        def log_message(self, format, *args):
-            return
+PORT = int(os.getenv("PORT", "10000"))
 
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    server.serve_forever()
+# ----------------- logging -----------------
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("rks_bot")
 
-# ================== Helpers ==================
-def normalize_phone(s: str) -> str | None:
+# ----------------- states -----------------
+ASK_NAME, CHOOSE_SERVICES, SERVICE_FLOW, ASK_TIME, ASK_CONTACT = range(5)
+
+# ----------------- helpers -----------------
+def normalize_phone(s: str) -> Optional[str]:
     if not s:
         return None
     s = s.strip()
@@ -57,83 +59,236 @@ def normalize_phone(s: str) -> str | None:
     if len(only_digits) < 10:
         return None
 
-    # RU: 8XXXXXXXXXX -> +7XXXXXXXXXX
+    # РФ: 8XXXXXXXXXX -> +7XXXXXXXXXX
     if digits.startswith("8") and len(only_digits) == 11:
         return "+7" + only_digits[1:]
-    if digits.startswith("7") and len(only_digits) == 11:
-        return "+7" + only_digits
     if digits.startswith("+7") and len(only_digits) == 11:
         return "+7" + only_digits[-10:]
-    # If already like +<country>...
+    if digits.startswith("7") and len(only_digits) == 11:
+        return "+7" + only_digits[-10:]
+
+    # если уже в + и похоже на номер — оставим как есть
     if digits.startswith("+") and len(only_digits) >= 10:
         return digits
 
-    return digits
+    # иначе просто вернем очищенное
+    return digits if len(only_digits) >= 10 else None
 
-def safe_text(update: Update) -> str:
-    return (update.message.text or "").strip() if update.message else ""
 
-# ================== Conversation states ==================
-ASK_NAME = 0
-PICK_SERVICES = 1
-TINT_PICK_ZONES = 2
-ASK_TIME = 3
-ASK_CONTACT = 4
+def safe_username(update: Update) -> str:
+    u = update.effective_user
+    if not u:
+        return "(нет user)"
+    return f"@{u.username}" if u.username else "(нет username)"
 
-# ================== Services data ==================
-SERVICES = [
-    "Тонировка",
-    "Полировка кузова",
-    "Керамика (защита)",
-    "Удаление водного камня (стёкла)",
-    "Антидождь",
-    "Полировка фар",
-    "Шлифовка/полировка стекла",
-]
 
-# callback keys
-CB_DONE = "done_services"
-CB_RESET = "reset_services"
-CB_SVC_PREFIX = "svc:"  # svc:<service_name>
+def order_services(selected: List[str]) -> List[str]:
+    # фиксированный порядок, чтобы логика шла одинаково
+    order = [
+        "tint",
+        "body_polish",
+        "ceramic",
+        "water_spots",
+        "anti_rain",
+        "headlights",
+        "glass_polish",
+    ]
+    sset = set(selected)
+    return [x for x in order if x in sset]
 
-# tint zones
-TINT_ZONES = [
-    "Полусфера зад",
-    "Полусфера перед",
-    "Боковые задние",
-    "Боковые передние",
-    "Лобовое",
-    "Заднее",
-]
-CB_TINT_DONE = "done_tint"
-CB_TINT_RESET = "reset_tint"
-CB_TINT_PREFIX = "tint:"  # tint:<zone>
 
-# ================== UI builders ==================
-def build_services_keyboard(selected: set[str]) -> InlineKeyboardMarkup:
+# ----------------- catalog -----------------
+SERVICES: Dict[str, str] = {
+    "tint": "Тонировка",
+    "body_polish": "Полировка кузова",
+    "ceramic": "Керамика (защита)",
+    "water_spots": "Удаление водного камня (стёкла)",
+    "anti_rain": "Антидождь",
+    "headlights": "Полировка фар",
+    "glass_polish": "Шлифовка/полировка стекла",
+}
+
+# callback data
+# choose services: svc|toggle|<key>  / svc|done / svc|reset
+# flow: flow|toggle|<opt> / flow|done / flow|pick|<opt>
+
+# ----------------- flow definitions -----------------
+@dataclass
+class Step:
+    kind: str  # "single" | "multi" | "text"
+    title: str
+    options: Optional[List[Tuple[str, str]]] = None  # (id, label)
+    hint: Optional[str] = None
+
+
+SERVICE_STEPS: Dict[str, List[Step]] = {
+    "tint": [
+        Step(
+            kind="multi",
+            title="Тонировка: что именно тонируем? (можно несколько)",
+            options=[
+                ("rear_hemi", "Полусфера зад"),
+                ("front_sides", "Боковые перед"),
+                ("rear_sides", "Боковые зад"),
+                ("windshield", "Лобовое"),
+                ("rear_window", "Заднее стекло"),
+            ],
+            hint="Совет: для комфорта и приватности чаще выбирают «полусфера зад».",
+        ),
+        Step(
+            kind="single",
+            title="Тонировка: какая темнота нужна?",
+            options=[
+                ("5", "5% (очень темно)"),
+                ("15", "15% (комфортно)"),
+                ("35", "35% (умеренно)"),
+                ("50", "50% (лёгкая)"),
+                ("idk", "Не знаю — посоветуйте"),
+            ],
+            hint="Подскажем вариант под задачи: ночь/город/трасса/парковка.",
+        ),
+    ],
+    "body_polish": [
+        Step(
+            kind="single",
+            title="Полировка кузова: какая цель?",
+            options=[
+                ("light", "Убрать «паутинку»/матовость (лёгкая)"),
+                ("deep", "Убрать больше царапин (глубокая)"),
+                ("prep", "Под керамику/защиту"),
+                ("idk", "Не знаю — посоветуйте"),
+            ],
+            hint="Совет: перед керамикой почти всегда делаем подготовку/полировку.",
+        )
+    ],
+    "ceramic": [
+        Step(
+            kind="single",
+            title="Керамика: какой уровень защиты?",
+            options=[
+                ("1", "1 слой (базовая защита)"),
+                ("2", "2 слоя (лучше блеск/стойкость)"),
+                ("idk", "Не знаю — посоветуйте"),
+            ],
+            hint="Совет: максимальный эффект — на подготовленном лаке (полировка).",
+        )
+    ],
+    "water_spots": [
+        Step(
+            kind="single",
+            title="Водный камень на стеклах: как сильно?",
+            options=[
+                ("light", "Лёгкий налёт/разводы"),
+                ("medium", "Заметный налёт, плохо уходит"),
+                ("hard", "Очень сильный, «белесые» точки"),
+                ("idk", "Не знаю — посоветуйте"),
+            ],
+            hint="Совет: после удаления — лучше закрепить антидождём, чтобы дольше держалось.",
+        )
+    ],
+    "anti_rain": [
+        Step(
+            kind="single",
+            title="Антидождь: куда наносим?",
+            options=[
+                ("windshield", "Лобовое"),
+                ("front", "Лобовое + передние боковые"),
+                ("all", "Все стёкла"),
+                ("idk", "Не знаю — посоветуйте"),
+            ],
+            hint="Совет: самый популярный вариант — лобовое + передние боковые.",
+        )
+    ],
+    "headlights": [
+        Step(
+            kind="single",
+            title="Фары: какая проблема?",
+            options=[
+                ("dull", "Мутные/потеряли прозрачность"),
+                ("yellow", "Пожелтели"),
+                ("scratches", "Царапины"),
+                ("idk", "Не знаю — посоветуйте"),
+            ],
+            hint="Совет: после полировки можно защитить покрытием, чтобы не мутнели быстрее.",
+        )
+    ],
+    "glass_polish": [
+        Step(
+            kind="single",
+            title="Стекло: что именно беспокоит?",
+            options=[
+                ("wipers", "Следы от дворников"),
+                ("light", "Лёгкие царапины"),
+                ("deep", "Глубокие царапины/сколы (нужно оценить)"),
+                ("idk", "Не знаю — посоветуйте"),
+            ],
+            hint="Совет: глубокие повреждения иногда не убрать полностью — предупредим честно после осмотра.",
+        )
+    ],
+}
+
+
+def build_services_keyboard(selected: List[str]) -> InlineKeyboardMarkup:
     rows = []
-    for s in SERVICES:
-        mark = "✅" if s in selected else "⬜️"
-        rows.append([InlineKeyboardButton(f"{mark} {s}", callback_data=f"{CB_SVC_PREFIX}{s}")])
-    rows.append([
-        InlineKeyboardButton("Готово ✅", callback_data=CB_DONE),
-        InlineKeyboardButton("Сбросить ↩️", callback_data=CB_RESET),
-    ])
+    for key, label in SERVICES.items():
+        mark = "✅" if key in selected else "⬜️"
+        rows.append([InlineKeyboardButton(f"{mark} {label}", callback_data=f"svc|toggle|{key}")])
+    rows.append(
+        [
+            InlineKeyboardButton("Готово ✅", callback_data="svc|done"),
+            InlineKeyboardButton("Сбросить ↩️", callback_data="svc|reset"),
+        ]
+    )
     return InlineKeyboardMarkup(rows)
 
-def build_tint_keyboard(selected: set[str]) -> InlineKeyboardMarkup:
+
+def build_multi_keyboard(selected_ids: List[str], options: List[Tuple[str, str]]) -> InlineKeyboardMarkup:
     rows = []
-    for z in TINT_ZONES:
-        mark = "✅" if z in selected else "⬜️"
-        rows.append([InlineKeyboardButton(f"{mark} {z}", callback_data=f"{CB_TINT_PREFIX}{z}")])
-    rows.append([
-        InlineKeyboardButton("Готово ✅", callback_data=CB_TINT_DONE),
-        InlineKeyboardButton("Сбросить ↩️", callback_data=CB_TINT_RESET),
-    ])
+    for oid, label in options:
+        mark = "✅" if oid in selected_ids else "⬜️"
+        rows.append([InlineKeyboardButton(f"{mark} {label}", callback_data=f"flow|toggle|{oid}")])
+    rows.append([InlineKeyboardButton("Готово ✅", callback_data="flow|done")])
     return InlineKeyboardMarkup(rows)
 
-# ================== Handlers ==================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+def build_single_keyboard(options: List[Tuple[str, str]]) -> InlineKeyboardMarkup:
+    rows = []
+    for oid, label in options:
+        rows.append([InlineKeyboardButton(label, callback_data=f"flow|pick|{oid}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def service_recommendation(service_key: str, answers: Dict[str, Any]) -> str:
+    # короткие рекомендации “по ходу”
+    if service_key == "tint":
+        parts = answers.get("parts", [])
+        if "windshield" in parts:
+            return "💡 По лобовому: подберём вариант, чтобы было комфортно и без лишних вопросов по нормам."
+        return "💡 По тонировке: подберём плёнку под задачи (приватность/комфорт/ночь)."
+
+    if service_key == "water_spots":
+        return "💡 Чтобы налёт не возвращался быстро — часто делают «антидождь» после очистки."
+
+    if service_key == "ceramic":
+        return "💡 Максимальный эффект керамики — на подготовленном кузове (полировка/обезжиривание)."
+
+    if service_key == "body_polish":
+        return "💡 Если планируешь керамику — лучше сразу сделать подготовку, будет заметно круче."
+
+    if service_key == "anti_rain":
+        return "💡 Эффект сильнее всего ощущается на лобовом: вода уходит быстрее, меньше напряга в дождь."
+
+    if service_key == "headlights":
+        return "💡 После полировки можем защитить фары, чтобы прозрачность держалась дольше."
+
+    if service_key == "glass_polish":
+        return "💡 Глубокие повреждения оценим по месту — скажем честно, что реально убрать."
+
+    return ""
+
+
+# ----------------- conversation handlers -----------------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text(
         "Привет! Я помогу быстро подобрать услуги и записать тебя.\n\n"
@@ -141,111 +296,202 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ASK_NAME
 
+
 async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = safe_text(update)
+    name = (update.message.text or "").strip()
     if len(name) < 2:
         await update.message.reply_text("Напиши имя чуть понятнее 🙂")
         return ASK_NAME
 
     context.user_data["name"] = name
-    context.user_data["services_selected"] = set()
+    context.user_data["selected_services"] = []
+    kb = build_services_keyboard(context.user_data["selected_services"])
 
-    kb = build_services_keyboard(context.user_data["services_selected"])
     await update.message.reply_text(
         "Выбери услуги (можно несколько) и нажми «Готово ✅».",
         reply_markup=kb,
     )
-    return PICK_SERVICES
+    return CHOOSE_SERVICES
+
 
 async def services_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+    q = update.callback_query
+    await q.answer()
 
-    selected: set[str] = context.user_data.get("services_selected", set())
-    data = query.data or ""
+    data = (q.data or "").split("|")
+    selected: List[str] = context.user_data.get("selected_services", [])
 
-    if data == CB_RESET:
-        selected.clear()
-        context.user_data["services_selected"] = selected
-        await query.edit_message_reply_markup(reply_markup=build_services_keyboard(selected))
-        return PICK_SERVICES
+    if data[:2] == ["svc", "toggle"] and len(data) == 3:
+        key = data[2]
+        if key in SERVICES:
+            if key in selected:
+                selected.remove(key)
+            else:
+                selected.append(key)
+        context.user_data["selected_services"] = selected
+        await q.edit_message_reply_markup(reply_markup=build_services_keyboard(selected))
+        return CHOOSE_SERVICES
 
-    if data.startswith(CB_SVC_PREFIX):
-        svc = data[len(CB_SVC_PREFIX):]
-        if svc in selected:
-            selected.remove(svc)
-        else:
-            selected.add(svc)
-        context.user_data["services_selected"] = selected
-        await query.edit_message_reply_markup(reply_markup=build_services_keyboard(selected))
-        return PICK_SERVICES
+    if data == ["svc", "reset"]:
+        context.user_data["selected_services"] = []
+        await q.edit_message_reply_markup(reply_markup=build_services_keyboard([]))
+        return CHOOSE_SERVICES
 
-    if data == CB_DONE:
+    if data == ["svc", "done"]:
         if not selected:
-            await query.answer("Нужно выбрать хотя бы одну услугу 🙂", show_alert=True)
-            return PICK_SERVICES
+            await q.edit_message_text("Выбери хотя бы одну услугу 🙂", reply_markup=build_services_keyboard([]))
+            return CHOOSE_SERVICES
 
-        # If tint is selected -> ask zones first
-        if "Тонировка" in selected:
-            context.user_data["tint_zones"] = set()
-            await query.message.reply_text(
-                "Тонировка ✅\nВыбери что нужно затонировать (можно несколько) и нажми «Готово ✅».",
-                reply_markup=build_tint_keyboard(context.user_data["tint_zones"]),
-            )
-            return TINT_PICK_ZONES
+        # подготовим очередь услуг и старт первого сервиса
+        queue = order_services(selected)
+        context.user_data["service_queue"] = queue
+        context.user_data["service_index"] = 0
+        context.user_data["service_answers"] = {}  # service_key -> answers dict
 
-        # otherwise go to time
-        await query.message.reply_text(
-            "Когда тебе удобно приехать? (пример: «завтра после 18:00», «в выходные утром»)"
+        await q.edit_message_text("Отлично! Уточню пару моментов по выбранным услугам 👇")
+        return await start_next_service(update, context)
+
+    return CHOOSE_SERVICES
+
+
+async def start_next_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    idx = int(context.user_data.get("service_index", 0))
+    queue: List[str] = context.user_data.get("service_queue", [])
+    if idx >= len(queue):
+        # все услуги уточнили
+        await update.effective_chat.send_message(
+            "Когда тебе удобно подъехать? Напиши день/время (например: «сегодня после 18:00» или «в пятницу 12:00»)."
         )
         return ASK_TIME
 
-    return PICK_SERVICES
+    service_key = queue[idx]
+    context.user_data["current_service"] = service_key
+    context.user_data["current_step"] = 0
 
-async def tint_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+    # init answers for this service
+    all_answers: Dict[str, Dict[str, Any]] = context.user_data.get("service_answers", {})
+    all_answers.setdefault(service_key, {})
+    context.user_data["service_answers"] = all_answers
 
-    selected: set[str] = context.user_data.get("tint_zones", set())
-    data = query.data or ""
+    return await show_current_step(update, context)
 
-    if data == CB_TINT_RESET:
-        selected.clear()
-        context.user_data["tint_zones"] = selected
-        await query.edit_message_reply_markup(reply_markup=build_tint_keyboard(selected))
-        return TINT_PICK_ZONES
 
-    if data.startswith(CB_TINT_PREFIX):
-        zone = data[len(CB_TINT_PREFIX):]
-        if zone in selected:
-            selected.remove(zone)
-        else:
-            selected.add(zone)
-        context.user_data["tint_zones"] = selected
+async def show_current_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    service_key = context.user_data["current_service"]
+    step_idx = int(context.user_data.get("current_step", 0))
+    steps = SERVICE_STEPS.get(service_key, [])
 
-        # quick recommendations while selecting
-        # (short + useful, not spam)
-        if zone == "Лобовое":
-            await query.answer("Лобовое: можно атермальную плёнку — меньше жара и бликов.", show_alert=False)
+    if step_idx >= len(steps):
+        # сервис закончен — рекомендация и к следующему
+        ans = context.user_data["service_answers"][service_key]
+        rec = service_recommendation(service_key, ans)
+        if rec:
+            await update.effective_chat.send_message(rec)
 
-        await query.edit_message_reply_markup(reply_markup=build_tint_keyboard(selected))
-        return TINT_PICK_ZONES
+        context.user_data["service_index"] = int(context.user_data.get("service_index", 0)) + 1
+        return await start_next_service(update, context)
 
-    if data == CB_TINT_DONE:
-        if not selected:
-            await query.answer("Выбери хотя бы одну зону 🙂", show_alert=True)
-            return TINT_PICK_ZONES
+    step = steps[step_idx]
+    title = f"**{SERVICES.get(service_key, service_key)}**\n{step.title}"
+    hint = f"\n\n{step.hint}" if step.hint else ""
 
-        # After tint zones -> go to time
-        await query.message.reply_text(
-            "Отлично. Когда тебе удобно приехать? (пример: «завтра после 18:00», «в выходные утром»)"
+    if step.kind == "multi":
+        # answers store list
+        ans = context.user_data["service_answers"][service_key]
+        selected_ids = ans.get("parts", [])
+        kb = build_multi_keyboard(selected_ids, step.options or [])
+        await update.effective_chat.send_message(
+            title + hint,
+            reply_markup=kb,
+            parse_mode="Markdown",
         )
-        return ASK_TIME
+        return SERVICE_FLOW
 
-    return TINT_PICK_ZONES
+    if step.kind == "single":
+        kb = build_single_keyboard(step.options or [])
+        await update.effective_chat.send_message(
+            title + hint,
+            reply_markup=kb,
+            parse_mode="Markdown",
+        )
+        return SERVICE_FLOW
+
+    if step.kind == "text":
+        await update.effective_chat.send_message(title + hint, parse_mode="Markdown")
+        return SERVICE_FLOW
+
+    await update.effective_chat.send_message("Ошибка конфигурации шага.")
+    return ConversationHandler.END
+
+
+async def flow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = (q.data or "").split("|")
+
+    service_key = context.user_data.get("current_service")
+    step_idx = int(context.user_data.get("current_step", 0))
+    steps = SERVICE_STEPS.get(service_key, [])
+    if step_idx >= len(steps):
+        # на всякий случай
+        return await start_next_service(update, context)
+
+    step = steps[step_idx]
+    ans = context.user_data["service_answers"][service_key]
+
+    if data[:2] == ["flow", "toggle"] and step.kind == "multi" and len(data) == 3:
+        oid = data[2]
+        selected_ids = ans.get("parts", [])
+        if oid in selected_ids:
+            selected_ids.remove(oid)
+        else:
+            selected_ids.append(oid)
+        ans["parts"] = selected_ids
+        context.user_data["service_answers"][service_key] = ans
+
+        # обновим клавиатуру
+        kb = build_multi_keyboard(selected_ids, step.options or [])
+        await q.edit_message_reply_markup(reply_markup=kb)
+        return SERVICE_FLOW
+
+    if data == ["flow", "done"] and step.kind == "multi":
+        # не даем пройти пустым
+        if not ans.get("parts"):
+            await q.answer("Выбери хотя бы один пункт 🙂", show_alert=True)
+            return SERVICE_FLOW
+
+        context.user_data["current_step"] = step_idx + 1
+        # удалим клавиатуру у текущего сообщения
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return await show_current_step(update, context)
+
+    if data[:2] == ["flow", "pick"] and step.kind == "single" and len(data) == 3:
+        oid = data[2]
+        ans[f"step_{step_idx}"] = oid
+        context.user_data["service_answers"][service_key] = ans
+
+        # небольшая рекомендация сразу после выбора (если нужна)
+        rec = service_recommendation(service_key, ans)
+        # уберем клавиатуру и двинемся дальше
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        context.user_data["current_step"] = step_idx + 1
+        if rec and step_idx == 0:
+            await update.effective_chat.send_message(rec)
+
+        return await show_current_step(update, context)
+
+    return SERVICE_FLOW
+
 
 async def ask_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = safe_text(update)
+    txt = (update.message.text or "").strip()
     if len(txt) < 3:
         await update.message.reply_text("Напиши удобное время чуть подробнее 🙂")
         return ASK_TIME
@@ -261,28 +507,27 @@ async def ask_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
         resize_keyboard=True,
         one_time_keyboard=True,
     )
-
     await update.message.reply_text(
-        "Чтобы подтвердить запись/уточнить детали — оставь контакт:\n"
+        "Ок! Оставь удобный контакт:\n"
         "• нажми «Отправить контакт ☎️»\n"
         "• или напиши номер текстом\n"
-        "• или просто скажи «можно сюда в Telegram»",
+        "• или скажи «можно сюда в Telegram»",
         reply_markup=kb,
     )
     return ASK_CONTACT
 
+
 async def ask_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    contact_method = "telegram"
+    method = "telegram"
     phone = ""
 
-    if update.message and update.message.contact and update.message.contact.phone_number:
+    if update.message.contact and update.message.contact.phone_number:
+        method = "phone"
         phone = normalize_phone(update.message.contact.phone_number) or update.message.contact.phone_number
-        contact_method = "phone"
     else:
-        txt = safe_text(update)
-        low = txt.lower()
-        if "телег" in low or "сюда" in low or "tg" in low:
-            contact_method = "telegram"
+        txt = (update.message.text or "").strip()
+        if "телег" in txt.lower() or "сюда" in txt.lower() or "tg" in txt.lower():
+            method = "telegram"
             phone = ""
         else:
             p = normalize_phone(txt)
@@ -292,78 +537,99 @@ async def ask_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "Напиши в формате +7... или 8..., либо нажми «Отправить контакт ☎️»."
                 )
                 return ASK_CONTACT
-            contact_method = "phone"
+            method = "phone"
             phone = p
 
-    context.user_data["contact_method"] = contact_method
+    context.user_data["contact_method"] = method
     context.user_data["phone"] = phone
 
-    user = update.effective_user
-    username = f"@{user.username}" if user and user.username else "(нет username)"
-    tg_id = user.id if user else "?"
+    # сформируем лид
+    name = context.user_data.get("name", "")
+    username = safe_username(update)
+    selected = order_services(context.user_data.get("selected_services", []))
+    answers = context.user_data.get("service_answers", {})
+    time_pref = context.user_data.get("time", "")
 
-    services_selected: set[str] = context.user_data.get("services_selected", set())
-    tint_zones: set[str] = context.user_data.get("tint_zones", set())
+    lines = []
+    lines.append("🔥 НОВЫЙ ЛИД (RKS Studio)")
+    lines.append(f"Имя: {name}")
+    lines.append(f"TG: {username}")
+    lines.append(f"Услуги: " + ", ".join([SERVICES[s] for s in selected]))
+    lines.append(f"Когда удобно: {time_pref}")
+    lines.append(f"Контакт: {phone if method == 'phone' and phone else 'Telegram'}")
+    lines.append("")
+    lines.append("— Уточнения —")
 
-    services_lines = []
-    for s in sorted(services_selected):
-        if s == "Тонировка" and tint_zones:
-            services_lines.append(f"• {s}: {', '.join(sorted(tint_zones))}")
-        else:
-            services_lines.append(f"• {s}")
+    for sk in selected:
+        lines.append(f"\n• {SERVICES[sk]}")
+        a = answers.get(sk, {})
+        steps = SERVICE_STEPS.get(sk, [])
+        for i, step in enumerate(steps):
+            if step.kind == "multi":
+                parts = a.get("parts", [])
+                if step.options:
+                    label_map = dict(step.options)
+                    pretty = [label_map.get(x, x) for x in parts]
+                    lines.append("  - Выбор: " + (", ".join(pretty) if pretty else "-"))
+            elif step.kind == "single":
+                pick = a.get(f"step_{i}", "")
+                if step.options:
+                    label_map = dict(step.options)
+                    lines.append("  - " + step.title + ": " + label_map.get(pick, pick))
+            elif step.kind == "text":
+                val = a.get(f"step_{i}", "")
+                lines.append("  - " + step.title + ": " + val)
 
-    lead_text = (
-        "🔥 НОВЫЙ ЛИД (RKS)\n"
-        f"Имя: {context.user_data.get('name','')}\n"
-        f"TG: {username}\n"
-        f"TG_ID: {tg_id}\n"
-        f"Услуги:\n" + ("\n".join(services_lines) if services_lines else "• (нет)") + "\n"
-        f"Время: {context.user_data.get('time','')}\n"
-        f"Контакт: {(phone if phone else 'Telegram')}\n"
-    )
+    lead_text = "\n".join(lines)
 
-    # send to admin
+    # в лог
+    log.info("\n%s", lead_text)
+
+    # отправим тебе в TG
     try:
-        await context.bot.send_message(chat_id=int(ADMIN_CHAT_ID), text=lead_text)
+        await context.bot.send_message(chat_id=OWNER_CHAT_ID, text=lead_text)
     except Exception as e:
-        # still don't break user flow
-        print("ADMIN SEND ERROR:", e)
-        print(lead_text)
+        log.exception("Failed to send lead to OWNER_CHAT_ID: %s", e)
 
     await update.message.reply_text(
-        "✅ Принято! Я отправил заявку.\n"
-        "Мы свяжемся с тобой в ближайшее время.\n\n"
+        "✅ Готово! Я передал информацию менеджеру.\n"
         "Если хочешь — можешь дописать детали (фото/видео тоже можно).",
         reply_markup=None,
     )
     return ConversationHandler.END
 
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    if update.message:
-        await update.message.reply_text("Ок, остановил. Если нужно — напиши /start 🙂")
+    await update.message.reply_text("Ок, остановил. Если нужно — напиши /start 🙂")
     return ConversationHandler.END
 
-async def on_startup(app: Application):
-    # Make sure webhook is not set (avoid webhook/polling mixing)
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=False)
-    except Exception as e:
-        print("delete_webhook error:", e)
+
+# ----------------- webhook init -----------------
+async def post_init(app: Application):
+    # Устанавливаем webhook при старте, если задан WEBHOOK_BASE_URL
+    if WEBHOOK_BASE_URL:
+        webhook_url = WEBHOOK_BASE_URL.rstrip("/") + WEBHOOK_PATH
+        await app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+        log.info("Webhook set to: %s", webhook_url)
+    else:
+        log.warning("WEBHOOK_BASE_URL is empty. Webhook will not be set.")
+
 
 def main():
-    # Run port stub for Render Web Service
-    t = threading.Thread(target=run_port_stub, daemon=True)
-    t.start()
-
-    app = Application.builder().token(TOKEN).post_init(on_startup).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[CommandHandler("start", cmd_start)],
         states={
             ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_name)],
-            PICK_SERVICES: [CallbackQueryHandler(services_callback)],
-            TINT_PICK_ZONES: [CallbackQueryHandler(tint_callback)],
+            CHOOSE_SERVICES: [CallbackQueryHandler(services_callback, pattern=r"^svc\|")],
+            SERVICE_FLOW: [CallbackQueryHandler(flow_callback, pattern=r"^flow\|")],
             ASK_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_time)],
             ASK_CONTACT: [
                 MessageHandler(filters.CONTACT, ask_contact),
@@ -374,8 +640,25 @@ def main():
         allow_reentry=True,
     )
 
-    app.add_handler(conv)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.add_handler(conv)
+
+    # WEBHOOK mode for Render Web Service
+    if not WEBHOOK_BASE_URL:
+        raise RuntimeError("WEBHOOK_BASE_URL not set. For Render Web Service you must set it.")
+
+    # важно: url_path без ведущего "/"
+    url_path = WEBHOOK_PATH.lstrip("/")
+
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=url_path,
+        # webhook_url уже ставим в post_init, но это поле пусть будет согласовано
+        webhook_url=WEBHOOK_BASE_URL.rstrip("/") + WEBHOOK_PATH,
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
+
 
 if __name__ == "__main__":
     main()
