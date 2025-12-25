@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 import os
 import re
 import time
@@ -49,7 +47,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("rks_bot")
 
-# -------------------- Render health server (port binding) --------------------
+# -------------------- Render health server ("костыль" под бесплатный Web Service) --------------------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         body = json.dumps({"ok": True, "service": "rks-bot"}).encode("utf-8")
@@ -88,7 +86,7 @@ SERVICES = [
     ("toning", "Тонировка"),
     ("body_polish", "Полировка кузова"),
     ("ceramic", "Керамика (защита)"),
-    ("water_spots", "Удаление водного камня (стекла)"),
+    ("water_spots", "Удаление водного камня (стёкла)"),
     ("anti_rain", "Антидождь"),
     ("headlights", "Полировка фар"),
     ("glass_polish", "Шлифовка/полировка стекла"),
@@ -99,15 +97,13 @@ SERVICES = [
 SERVICE_LABEL = {k: v for k, v in SERVICES}
 
 # -------------------- HELPERS --------------------
-def now_local() -> datetime:
+def now_local():
     return datetime.now()
 
-
-def clean_text(s: str) -> str:
+def clean_text(s):
     return (s or "").strip()
 
-
-def normalize_phone(s: str) -> str | None:
+def normalize_phone(s):
     if not s:
         return None
     s = s.strip()
@@ -117,6 +113,7 @@ def normalize_phone(s: str) -> str | None:
     if len(only_digits) < 10:
         return None
 
+    # RU normalize
     if digits_plus.startswith("8") and len(only_digits) == 11:
         return "+7" + only_digits[1:]
     if digits_plus.startswith("7") and len(only_digits) == 11:
@@ -128,8 +125,13 @@ def normalize_phone(s: str) -> str | None:
 
     return None
 
-
-def parse_datetime_ru(s: str) -> datetime | None:
+def parse_datetime_ru(s):
+    """
+    Support:
+    - "сегодня 18:00"
+    - "завтра 12:30"
+    - "25.12 14:00" or "25.12.2025 14:00"
+    """
     txt = clean_text(s).lower()
     if not txt:
         return None
@@ -154,7 +156,7 @@ def parse_datetime_ru(s: str) -> datetime | None:
         return None
     hh = int(m_time.group(1))
     mm = int(m_time.group(2))
-    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+    if hh > 23 or mm > 59:
         return None
 
     m_date = re.search(r"(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?", txt)
@@ -178,26 +180,26 @@ def parse_datetime_ru(s: str) -> datetime | None:
     except ValueError:
         return None
 
-    if (not m_date) or (m_date and not m_date.group(3)):
-        if dt.date() < base.date():
-            try:
-                dt = datetime(base.year + 1, dt.month, dt.day, dt.hour, dt.minute)
-            except ValueError:
-                pass
+    # if entered dd.mm without year and date already past -> next year
+    if m_date and not m_date.group(3) and dt.date() < base.date():
+        try:
+            dt = datetime(base.year + 1, dt.month, dt.day, dt.hour, dt.minute)
+        except ValueError:
+            pass
 
     return dt
 
-
-def is_future_time(dt: datetime) -> bool:
+def is_future_time(dt):
     return dt > now_local() + timedelta(minutes=5)
 
-
-def lead_temperature(data: dict) -> str:
+def lead_temperature(data):
     score = 0
 
+    # contact
     if data.get("contact_method") == "phone" and data.get("phone"):
         score += 2
 
+    # time proximity
     dt = data.get("visit_dt")
     if isinstance(dt, datetime):
         diff = dt - now_local()
@@ -206,6 +208,7 @@ def lead_temperature(data: dict) -> str:
         elif diff <= timedelta(days=3):
             score += 1
 
+    # services weight
     selected = data.get("services_selected", [])
     for svc in selected:
         if svc in {"ceramic", "body_polish", "glass_polish", "interior"}:
@@ -221,27 +224,26 @@ def lead_temperature(data: dict) -> str:
         score += 1
 
     if score >= 7:
-        return "ГОРЯЧИЙ"
+        return "ГОРЯЧИЙ 🔥"
     if score >= 4:
-        return "ТЕПЛЫЙ"
-    return "ХОЛОДНЫЙ"
+        return "ТЁПЛЫЙ 🙂"
+    return "ХОЛОДНЫЙ ❄️"
 
-
-def services_keyboard(selected: set[str]) -> InlineKeyboardMarkup:
+# -------------------- KEYBOARDS --------------------
+def services_keyboard(selected):
     rows = []
     for key, label in SERVICES:
-        mark = "[x] " if key in selected else "[ ] "
+        mark = "✅ " if key in selected else "☐ "
         rows.append([InlineKeyboardButton(mark + label, callback_data="svc:" + key)])
     rows.append(
         [
-            InlineKeyboardButton("Готово", callback_data="svc_done"),
-            InlineKeyboardButton("Сбросить", callback_data="svc_reset"),
+            InlineKeyboardButton("Готово ✅", callback_data="svc_done"),
+            InlineKeyboardButton("Сбросить ↩️", callback_data="svc_reset"),
         ]
     )
     return InlineKeyboardMarkup(rows)
 
-
-def yes_no_kb(prefix: str) -> InlineKeyboardMarkup:
+def yes_no_kb(prefix):
     return InlineKeyboardMarkup(
         [[
             InlineKeyboardButton("Да", callback_data=prefix + ":yes"),
@@ -249,11 +251,10 @@ def yes_no_kb(prefix: str) -> InlineKeyboardMarkup:
         ]]
     )
 
-
-def contact_kb() -> ReplyKeyboardMarkup:
+def contact_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton("Отправить контакт", request_contact=True)],
+            [KeyboardButton("Отправить контакт ☎️", request_contact=True)],
             [KeyboardButton("Написать номер текстом")],
             [KeyboardButton("Оставлю Telegram, можно сюда")],
         ],
@@ -261,8 +262,7 @@ def contact_kb() -> ReplyKeyboardMarkup:
         one_time_keyboard=True,
     )
 
-
-def channel_kb() -> InlineKeyboardMarkup:
+def channel_kb():
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Наши работы (TG канал)", url=WORKS_CHANNEL_URL)],
@@ -270,47 +270,72 @@ def channel_kb() -> InlineKeyboardMarkup:
         ]
     )
 
+def choice_kb(prefix, options):
+    rows = []
+    for idx, opt in enumerate(options):
+        rows.append([InlineKeyboardButton(opt, callback_data=f"{prefix}:{idx}")])
+    return InlineKeyboardMarkup(rows)
 
-def compute_upsells(user_data: dict) -> list[dict]:
+def toning_areas_kb(selected):
+    areas = [
+        ("rear_hemi", "Полусфера зад"),
+        ("front_hemi", "Полусфера перед"),
+        ("side_rear", "Боковые зад"),
+        ("side_front", "Боковые перед"),
+        ("windshield", "Лобовое"),
+        ("rear_window", "Заднее стекло"),
+    ]
+    rows = []
+    for k, label in areas:
+        mark = "✅ " if k in selected else "☐ "
+        rows.append([InlineKeyboardButton(mark + label, callback_data="ta:" + k)])
+    rows.append(
+        [
+            InlineKeyboardButton("Готово ✅", callback_data="ta_done"),
+            InlineKeyboardButton("Сбросить ↩️", callback_data="ta_reset"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+def toning_percent_kb():
+    percents = ["2%", "5%", "15%", "20%", "35%", "Не знаю"]
+    rows = [[InlineKeyboardButton(p, callback_data="tp:" + p)] for p in percents]
+    return InlineKeyboardMarkup(rows)
+
+# -------------------- UPSELLS --------------------
+def compute_upsells(user_data):
     selected = set(user_data.get("services_selected", []))
-    ans = user_data.get("services_answers", {})
+    ans = user_data.get("services_answers", {}) or {}
 
-    upsells: list[dict] = []
+    upsells = []
 
     if "body_polish" in selected and "ceramic" not in selected:
-        upsells.append({"title": "Керамика после полировки", "reason": "защита и блеск дольше"})
+        upsells.append({"title": "Керамика после полировки", "reason": "блеск и защита держатся дольше"})
 
     if "water_spots" in selected and "anti_rain" not in selected:
-        upsells.append({"title": "Антидождь после удаления налета", "reason": "стекла дольше чистые"})
+        upsells.append({"title": "Антидождь после удаления налёта", "reason": "стекло дольше чистое, вода скатывается"})
 
     if "glass_polish" in selected and "anti_rain" not in selected:
         chips = ans.get("glass_has_chips")
         if chips != "Да":
-            upsells.append({"title": "Антидождь после полировки стекла", "reason": "эффект сильнее"})
-
-    if "interior" in selected:
-        it = ans.get("interior_type")
-        if it == "Чистка кожи + пропитка":
-            upsells.append({"title": "Усиленная пропитка кожи", "reason": "защита и мягкость дольше"})
+            upsells.append({"title": "Антидождь после полировки стекла", "reason": "на ровном стекле работает лучше"})
 
     return upsells
 
-
-def format_upsells_for_client(upsells: list[dict], limit: int = 3) -> str:
+def format_upsells_for_client(upsells, limit=3):
     if not upsells:
         return ""
     items = upsells[:limit]
-    lines = ["- " + u["title"] + " (" + u["reason"] + ")" for u in items]
-    return "Часто берут вместе (по ситуации):\n" + "\n".join(lines)
+    lines = [f"• {u['title']} — {u['reason']}" for u in items]
+    return "Кстати, часто берут вместе:\n" + "\n".join(lines)
 
-
-def format_upsells_for_manager(upsells: list[dict]) -> str:
+def format_upsells_for_manager(upsells):
     if not upsells:
-        return "-"
-    return "\n".join(["- " + u["title"] + " (" + u["reason"] + ")" for u in upsells])
+        return "—"
+    return "\n".join([f"• {u['title']} — {u['reason']}" for u in upsells])
 
-
-def build_service_flow(selected_services: list[str]) -> list[dict]:
+# -------------------- FLOW ENGINE --------------------
+def build_service_flow(selected_services):
     flow = []
     for svc in selected_services:
         label = SERVICE_LABEL.get(svc, svc)
@@ -318,30 +343,34 @@ def build_service_flow(selected_services: list[str]) -> list[dict]:
         if svc == "toning":
             flow.append({
                 "type": "toning_areas",
-                "service": svc,
                 "key": "toning_areas",
-                "text": label + "\nКакие зоны нужно затонировать? (можно несколько). Затем нажми 'Готово'.",
+                "text": (
+                    f"**{label}**\n"
+                    "Какие зоны нужно затонировать? (можно несколько)\n\n"
+                    "Нажимай по кнопкам и затем **Готово ✅**."
+                ),
             })
             flow.append({
                 "type": "toning_percent",
-                "service": svc,
                 "key": "toning_percent",
-                "text": label + "\nКакой процент затемнения хочешь?",
+                "text": (
+                    f"**{label}**\n"
+                    "Какой процент затемнения хочешь?\n\n"
+                    "Если не уверен — выбери «Не знаю»."
+                ),
             })
             flow.append({
                 "type": "yesno",
-                "service": svc,
                 "key": "toning_old_film",
-                "text": label + "\nЕсть старая пленка, которую нужно снять?",
+                "text": f"**{label}**\nЕсть старая плёнка, которую нужно снять?",
                 "kb_prefix": "toning_old",
             })
 
         elif svc == "body_polish":
             flow.append({
                 "type": "choice",
-                "service": svc,
                 "key": "body_polish_goal",
-                "text": label + "\nКакая цель полировки?",
+                "text": f"**{label}**\nКакая цель полировки?",
                 "options": [
                     "Убрать мелкие царапины/паутинку",
                     "Вернуть блеск/глубину цвета",
@@ -353,144 +382,110 @@ def build_service_flow(selected_services: list[str]) -> list[dict]:
         elif svc == "ceramic":
             flow.append({
                 "type": "choice",
-                "service": svc,
                 "key": "ceramic_stage",
-                "text": label + "\nКерамика впервые или обновление?",
+                "text": f"**{label}**\nКерамика делается **впервые** или это **обновление**?",
                 "options": ["Впервые", "Обновление (керамика уже была)", "Не знаю"],
             })
             flow.append({
                 "type": "choice",
-                "service": svc,
                 "key": "ceramic_need",
-                "text": label + "\nЧто важнее всего от керамики?",
-                "options": ["Максимальный блеск", "Защита", "Легче мыть авто", "Не знаю, посоветуй"],
+                "text": f"**{label}**\nЧто важнее всего от керамики?",
+                "options": ["Максимальный блеск", "Защита от реагентов/грязи", "Легче мыть авто", "Не знаю, посоветуй"],
+            })
+            flow.append({
+                "type": "info",
+                "key": "ceramic_tip",
+                "text": "Совет: перед керамикой лучше сделать подготовку/полировку — покрытие ляжет идеально и эффект будет заметнее.",
             })
 
         elif svc == "water_spots":
             flow.append({
                 "type": "choice",
-                "service": svc,
                 "key": "water_spots_where",
-                "text": label + "\nНа каких стеклах налет сильнее?",
+                "text": f"**{label}**\nНа каких стёклах налёт/водный камень сильнее?",
                 "options": ["Лобовое", "Боковые", "Заднее", "Везде"],
             })
 
         elif svc == "anti_rain":
             flow.append({
                 "type": "choice",
-                "service": svc,
                 "key": "anti_rain_where",
-                "text": label + "\nКуда нанести антидождь?",
-                "options": ["Только лобовое", "Лобовое + боковые", "Все стекла", "Не знаю, посоветуй"],
+                "text": f"**{label}**\nКуда нанести антидождь?",
+                "options": ["Только лобовое", "Лобовое + боковые", "Все стёкла", "Не знаю, посоветуй"],
             })
 
         elif svc == "headlights":
             flow.append({
                 "type": "choice",
-                "service": svc,
                 "key": "headlights_state",
-                "text": label + "\nЧто с фарами?",
-                "options": ["Сильно мутные/желтые", "Есть царапины/потертости", "Профилактика", "Не знаю"],
+                "text": f"**{label}**\nФары мутные/желтые или просто мелкие царапины?",
+                "options": ["Сильно мутные/желтые", "Есть царапины/потёртости", "Хочу профилактику", "Не знаю"],
             })
 
         elif svc == "glass_polish":
             flow.append({
                 "type": "choice",
-                "service": svc,
                 "key": "glass_polish_problem",
-                "text": label + "\nЧто беспокоит больше всего?",
-                "options": ["Следы дворников", "Мелкие царапины", "Пескоструй/мутность", "Не знаю, диагностика"],
+                "text": f"**{label}**\nЧто на стекле беспокоит больше всего?",
+                "options": ["Дворники оставляют следы/затиры", "Мелкие царапины", "Пескоструй/мутность", "Не знаю, нужна диагностика"],
             })
             flow.append({
                 "type": "yesno",
-                "service": svc,
                 "key": "glass_has_chips",
-                "text": label + "\nЕсть сколы/трещины на стекле?",
+                "text": f"**{label}**\nЕсть **сколы/трещины** на стекле?",
                 "kb_prefix": "glass_chips",
             })
             flow.append({
                 "type": "info",
-                "service": svc,
                 "key": "glass_chips_tip",
-                "text": "Важно: если есть сколы/трещины, полировка/шлифовка не делается. Нужна замена стекла. Мы можем заменить.",
+                "text": (
+                    "Важно: если есть **сколы/трещины**, то **шлифовка/полировка не делается** — нужна **замена стекла**.\n"
+                    "Мы можем заменить — оставьте заявку, менеджер всё подскажет."
+                ),
             })
 
         elif svc == "interior":
             flow.append({
                 "type": "choice",
-                "service": svc,
                 "key": "interior_type",
-                "text": label + "\nЧто нужно по салону?",
+                "text": f"**{label}**\nЧто именно нужно по салону?",
                 "options": ["Экспресс уборка", "Полная химчистка салона", "Чистка кожи + пропитка", "Не знаю, посоветуй"],
             })
 
         elif svc == "engine_wash":
             flow.append({
                 "type": "yesno",
-                "service": svc,
                 "key": "engine_recent",
-                "text": label + "\nМойку мотора делали ранее?",
+                "text": f"**{label}**\nМойку мотора делали ранее?",
                 "kb_prefix": "engine_prev",
+            })
+            flow.append({
+                "type": "info",
+                "key": "engine_tip",
+                "text": "Совет: делаем аккуратно + консервация — это защищает разъёмы и резинки, моторный отсек выглядит аккуратно дольше.",
             })
 
     return flow
 
-
-def choice_kb(prefix: str, options: list[str]) -> InlineKeyboardMarkup:
-    rows = []
-    for idx, opt in enumerate(options):
-        rows.append([InlineKeyboardButton(opt, callback_data=prefix + ":" + str(idx))])
-    return InlineKeyboardMarkup(rows)
-
-
-def toning_areas_kb(selected: set[str]) -> InlineKeyboardMarkup:
-    areas = [
-        ("rear_hemi", "Полусфера зад"),
-        ("front_hemi", "Полусфера перед"),
-        ("side_rear", "Боковые зад"),
-        ("side_front", "Боковые перед"),
-        ("windshield", "Лобовое"),
-        ("rear_window", "Заднее стекло"),
-    ]
-    rows = []
-    for k, label in areas:
-        mark = "[x] " if k in selected else "[ ] "
-        rows.append([InlineKeyboardButton(mark + label, callback_data="ta:" + k)])
-    rows.append(
-        [
-            InlineKeyboardButton("Готово", callback_data="ta_done"),
-            InlineKeyboardButton("Сбросить", callback_data="ta_reset"),
-        ]
-    )
-    return InlineKeyboardMarkup(rows)
-
-
-def toning_percent_kb() -> InlineKeyboardMarkup:
-    percents = ["2%", "5%", "15%", "20%", "35%", "Не знаю"]
-    rows = [[InlineKeyboardButton(p, callback_data="tp:" + p)] for p in percents]
-    return InlineKeyboardMarkup(rows)
-
-
-# -------------------- HANDLERS --------------------
+# -------------------- CORE HANDLERS --------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Привет! Как тебя зовут?")
+    await update.message.reply_text(
+        "Привет! Я помогу быстро подобрать услуги и записать тебя.\n\nКак тебя зовут?"
+    )
     return S_NAME
-
 
 async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Давай заново. Как тебя зовут?")
+    await update.message.reply_text("Ок! Давай заново.\n\nКак тебя зовут?")
     return S_NAME
-
 
 async def cb_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     context.user_data.clear()
-    await q.message.reply_text("Давай заново. Как тебя зовут?")
+    await q.message.reply_text("Ок! Давай заново.\n\nКак тебя зовут?")
     return S_NAME
-
 
 async def on_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = clean_text(update.message.text)
@@ -500,32 +495,31 @@ async def on_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["name"] = name
     await update.message.reply_text(
-        "Напиши: марка, модель, год выпуска.\nПример: Toyota Camry 2018"
+        "Отлично.\nНапиши: **марка, модель, год выпуска**.\nПример: `Toyota Camry 2018`",
+        parse_mode=ParseMode.MARKDOWN,
     )
     return S_CAR
-
 
 async def on_car(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = clean_text(update.message.text)
     if len(txt) < 4:
-        await update.message.reply_text("Чуть подробнее. Например: Toyota Camry 2018")
+        await update.message.reply_text("Чуть подробнее. Например: `Toyota Camry 2018`", parse_mode=ParseMode.MARKDOWN)
         return S_CAR
 
     context.user_data["car"] = txt
     context.user_data["services_selected_set"] = set()
 
     await update.message.reply_text(
-        "Выбери услуги (можно несколько) и нажми 'Готово'.",
+        "Выбери услуги (можно несколько) и нажми «Готово ✅».",
         reply_markup=services_keyboard(context.user_data["services_selected_set"]),
     )
     return S_SERVICES
-
 
 async def cb_services(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    selected: set[str] = context.user_data.get("services_selected_set", set())
+    selected = context.user_data.get("services_selected_set", set())
     data = q.data
 
     if data.startswith("svc:"):
@@ -534,6 +528,7 @@ async def cb_services(update: Update, context: ContextTypes.DEFAULT_TYPE):
             selected.remove(svc)
         else:
             selected.add(svc)
+
         context.user_data["services_selected_set"] = selected
         await q.edit_message_reply_markup(reply_markup=services_keyboard(selected))
         return S_SERVICES
@@ -546,7 +541,7 @@ async def cb_services(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "svc_done":
         if not selected:
-            await q.message.reply_text("Выбери хотя бы одну услугу.")
+            await q.message.reply_text("Выбери хотя бы одну услугу 🙂")
             return S_SERVICES
 
         ordered = [k for k, _ in SERVICES if k in selected]
@@ -555,11 +550,10 @@ async def cb_services(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["flow"] = build_service_flow(ordered)
         context.user_data["flow_i"] = 0
 
-        await q.message.reply_text("Уточню пару моментов по выбранным услугам.")
+        await q.message.reply_text("Отлично! Уточню пару моментов по выбранным услугам.")
         return await ask_next_flow_step(q.message, context)
 
     return S_SERVICES
-
 
 async def ask_next_flow_step(message, context: ContextTypes.DEFAULT_TYPE):
     flow = context.user_data.get("flow", [])
@@ -572,50 +566,51 @@ async def ask_next_flow_step(message, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text(tip)
 
         await message.reply_text(
-            "Когда удобно подъехать? Примеры:\n"
-            "- сегодня 18:00\n"
-            "- завтра 12:00\n"
-            "- 25.12 14:00"
+            "Когда тебе удобно подъехать? Напиши **день/время**.\n"
+            "Примеры:\n"
+            "• `сегодня 18:00`\n"
+            "• `завтра 12:00`\n"
+            "• `25.12 14:00`",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return S_TIME
 
     step = flow[i]
     stype = step["type"]
-    text = step["text"]
 
     if stype == "info":
-        if step["key"] == "glass_chips_tip":
-            ans = context.user_data.get("services_answers", {}).get("glass_has_chips")
+        # показываем "замена стекла" только если chips == Да
+        if step.get("key") == "glass_chips_tip":
+            ans = (context.user_data.get("services_answers") or {}).get("glass_has_chips")
             if ans != "Да":
                 context.user_data["flow_i"] = i + 1
                 return await ask_next_flow_step(message, context)
 
-        await message.reply_text(text)
+        await message.reply_text(step["text"], parse_mode=ParseMode.MARKDOWN)
         context.user_data["flow_i"] = i + 1
         return await ask_next_flow_step(message, context)
 
     if stype == "choice":
         kb = choice_kb("ch:" + step["key"], step["options"])
-        await message.reply_text(text, reply_markup=kb)
+        await message.reply_text(step["text"], parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
         return S_SVC_FLOW
 
     if stype == "yesno":
         kb = yes_no_kb(step["kb_prefix"])
-        await message.reply_text(text, reply_markup=kb)
+        await message.reply_text(step["text"], parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
         return S_SVC_FLOW
 
     if stype == "toning_areas":
         context.user_data["toning_areas_set"] = set()
-        await message.reply_text(text, reply_markup=toning_areas_kb(set()))
+        await message.reply_text(step["text"], parse_mode=ParseMode.MARKDOWN, reply_markup=toning_areas_kb(set()))
         return S_SVC_FLOW
 
     if stype == "toning_percent":
-        await message.reply_text(text, reply_markup=toning_percent_kb())
+        await message.reply_text(step["text"], parse_mode=ParseMode.MARKDOWN, reply_markup=toning_percent_kb())
         return S_SVC_FLOW
 
-    await message.reply_text(text)
+    await message.reply_text(step["text"], parse_mode=ParseMode.MARKDOWN)
     return S_SVC_FLOW
-
 
 async def cb_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -630,8 +625,9 @@ async def cb_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answers = context.user_data.setdefault("services_answers", {})
     data = q.data
 
+    # --- Toning areas multi ---
     if step["type"] == "toning_areas":
-        sel: set[str] = context.user_data.get("toning_areas_set", set())
+        sel = context.user_data.get("toning_areas_set", set())
 
         if data.startswith("ta:"):
             k = data.split(":", 1)[1]
@@ -646,12 +642,12 @@ async def cb_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "ta_reset":
             sel.clear()
             context.user_data["toning_areas_set"] = sel
-            await q.edit_message_reply_markup(reply_markup=toning_areas_kb(sel))
+            await q.edit_message_reply_markup(reply_markupReply_markup=toning_areas_kb(sel))
             return S_SVC_FLOW
 
         if data == "ta_done":
             if not sel:
-                await q.message.reply_text("Выбери хотя бы одну зону.")
+                await q.message.reply_text("Выбери хотя бы одну зону 🙂")
                 return S_SVC_FLOW
 
             label_map = {
@@ -668,6 +664,7 @@ async def cb_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return S_SVC_FLOW
 
+    # --- Toning percent ---
     if step["type"] == "toning_percent":
         if data.startswith("tp:"):
             val = data.split(":", 1)[1]
@@ -677,6 +674,7 @@ async def cb_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await ask_next_flow_step(q.message, context)
         return S_SVC_FLOW
 
+    # --- Choice ---
     if step["type"] == "choice":
         prefix = "ch:" + step["key"] + ":"
         if data.startswith(prefix):
@@ -688,6 +686,7 @@ async def cb_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await ask_next_flow_step(q.message, context)
         return S_SVC_FLOW
 
+    # --- Yes/No ---
     if step["type"] == "yesno":
         pref = step["kb_prefix"] + ":"
         if data.startswith(pref):
@@ -700,34 +699,43 @@ async def cb_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return S_SVC_FLOW
 
-
 async def on_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = clean_text(update.message.text)
     dt = parse_datetime_ru(txt)
     if not dt:
         await update.message.reply_text(
-            "Не понял дату/время. Примеры:\n"
-            "- сегодня 18:00\n- завтра 12:00\n- 25.12 14:00"
+            "Не понял дату/время.\n"
+            "Напиши в формате:\n"
+            "• `сегодня 18:00`\n"
+            "• `завтра 12:00`\n"
+            "• `25.12 14:00`",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return S_TIME
 
     if not is_future_time(dt):
-        await update.message.reply_text("Нужно выбрать время в будущем (минимум через 5 минут).")
+        await update.message.reply_text(
+            "Нужно выбрать время **в будущем**.\nНапример: `сегодня 18:00` или `завтра 12:00`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return S_TIME
 
     context.user_data["visit_dt"] = dt
     await update.message.reply_text(
-        "Оставь контакт: отправь контакт, или напиши номер, или скажи 'можно сюда в Telegram'.",
+        "Ок! Осталось оставить удобный контакт:\n"
+        "• нажми «Отправить контакт ☎️»\n"
+        "• или напиши номер текстом\n"
+        "• или скажи «можно сюда в Telegram»",
         reply_markup=contact_kb(),
     )
     return S_CONTACT
 
-
 async def on_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # contact button
     if update.message.contact and update.message.contact.phone_number:
         phone = normalize_phone(update.message.contact.phone_number)
         if not phone:
-            await update.message.reply_text("Не смог распознать номер. Напиши номер текстом.")
+            await update.message.reply_text("Не смог распознать номер. Напиши номер текстом: +7XXXXXXXXXX или 8XXXXXXXXXX")
             return S_CONTACT
         context.user_data["phone"] = phone
         context.user_data["contact_method"] = "phone"
@@ -739,145 +747,141 @@ async def on_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             phone = normalize_phone(txt)
             if not phone:
-                await update.message.reply_text("Номер некорректный. Пример: +79991234567 или 89991234567")
+                await update.message.reply_text(
+                    "Номер некорректный.\nНапиши `+7XXXXXXXXXX` или `8XXXXXXXXXX`, либо нажми «Отправить контакт ☎️».",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
                 return S_CONTACT
             context.user_data["phone"] = phone
             context.user_data["contact_method"] = "phone"
 
     await send_lead_to_manager(update, context)
 
-    glass_has_chips = context.user_data.get("services_answers", {}).get("glass_has_chips") == "Да"
+    glass_has_chips = (context.user_data.get("services_answers") or {}).get("glass_has_chips") == "Да"
     extra = ""
     if glass_has_chips:
-        extra = "\n\nПо стеклу: при сколах/трещинах полировка/шлифовка не делается, нужна замена стекла (можем заменить)."
+        extra = (
+            "\n\nПо стеклу: если есть сколы/трещины — полировка/шлифовка не делается. "
+            "Нужна замена стекла. Мы можем заменить — менеджер подскажет."
+        )
 
     await update.message.reply_text(
-        "Принято! Я передал заявку менеджеру. Он свяжется с тобой.\n\n"
-        "Пока ждешь - можешь посмотреть наши работы.",
+        "Заявка принята! Я передал её менеджеру.\n"
+        "Он свяжется с тобой.\n\n"
+        "Пока ждёшь — можешь посмотреть наши работы:",
         reply_markup=channel_kb(),
     )
     if extra:
         await update.message.reply_text(extra)
-
     return S_DONE
-
 
 async def send_lead_to_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = context.user_data
     user = update.effective_user
 
-    tg_username = ("@" + user.username) if user and user.username else "-"
-    tg_id = str(user.id) if user else "-"
+    tg_username = ("@" + user.username) if user and user.username else "—"
+    tg_id = str(user.id) if user else "—"
 
     selected = data.get("services_selected", [])
-    answers = data.get("services_answers", {})
+    answers = data.get("services_answers", {}) or {}
 
     svc_lines = []
     for svc in selected:
         label = SERVICE_LABEL.get(svc, svc)
-        svc_lines.append("- " + label)
+        svc_lines.append("• " + label)
 
         if svc == "toning":
             areas = answers.get("toning_areas")
             percent = answers.get("toning_percent")
             oldfilm = answers.get("toning_old_film")
             if areas:
-                svc_lines.append("   zones: " + ", ".join(areas))
+                svc_lines.append("   - Зоны: " + ", ".join(areas))
             if percent:
-                svc_lines.append("   percent: " + percent)
+                svc_lines.append("   - Процент: " + percent)
             if oldfilm:
-                svc_lines.append("   old film: " + oldfilm)
+                svc_lines.append("   - Старая плёнка: " + oldfilm)
 
         if svc == "body_polish":
             v = answers.get("body_polish_goal")
             if v:
-                svc_lines.append("   goal: " + v)
+                svc_lines.append("   - Цель: " + v)
 
         if svc == "ceramic":
             stage = answers.get("ceramic_stage")
             need = answers.get("ceramic_need")
             if stage:
-                svc_lines.append("   first/renew: " + stage)
+                svc_lines.append("   - Впервые/обновление: " + stage)
             if need:
-                svc_lines.append("   priority: " + need)
+                svc_lines.append("   - Приоритет: " + need)
 
         if svc == "water_spots":
             v = answers.get("water_spots_where")
             if v:
-                svc_lines.append("   where: " + v)
+                svc_lines.append("   - Где сильнее: " + v)
 
         if svc == "anti_rain":
             v = answers.get("anti_rain_where")
             if v:
-                svc_lines.append("   where: " + v)
+                svc_lines.append("   - Куда нанести: " + v)
 
         if svc == "headlights":
             v = answers.get("headlights_state")
             if v:
-                svc_lines.append("   state: " + v)
+                svc_lines.append("   - Состояние: " + v)
 
         if svc == "glass_polish":
             v = answers.get("glass_polish_problem")
             chips = answers.get("glass_has_chips")
             if v:
-                svc_lines.append("   problem: " + v)
+                svc_lines.append("   - Проблема: " + v)
             if chips:
-                svc_lines.append("   chips/cracks: " + chips)
+                svc_lines.append("   - Сколы/трещины: " + chips)
                 if chips == "Да":
-                    svc_lines.append("   note: polishing not possible, replacement needed (we can replace).")
+                    svc_lines.append("   - Важно: полировка/шлифовка невозможна, нужна замена стекла (можем заменить).")
 
         if svc == "interior":
             v = answers.get("interior_type")
             if v:
-                svc_lines.append("   type: " + v)
+                svc_lines.append("   - Что нужно: " + v)
 
         if svc == "engine_wash":
             v = answers.get("engine_recent")
             if v:
-                svc_lines.append("   washed before: " + v)
+                svc_lines.append("   - Делали ранее: " + v)
 
-    dt: datetime = data.get("visit_dt")
-    dt_str = dt.strftime("%d.%m.%Y %H:%M") if isinstance(dt, datetime) else "-"
+    dt = data.get("visit_dt")
+    dt_str = dt.strftime("%d.%m.%Y %H:%M") if isinstance(dt, datetime) else "—"
 
-    contact_method = data.get("contact_method", "-")
+    contact_method = data.get("contact_method", "—")
     phone = data.get("phone", "")
 
     temp = lead_temperature(data)
-
     upsells = compute_upsells(data)
     upsells_text = format_upsells_for_manager(upsells)
 
-    # Manager text fully in Russian
-    contact_label = "Телефон" if contact_method == "phone" else "Telegram"
-    service_block = "\n".join(svc_lines)
-
     text = (
         "НОВАЯ ЗАЯВКА (RKS studio)\n\n"
-        f"Клиент: {data.get('name','-')}\n"
-        f"Авто: {data.get('car','-')}\n"
+        f"Клиент: {data.get('name','—')}\n"
+        f"Авто: {data.get('car','—')}\n"
         f"Когда удобно: {dt_str}\n"
         f"TG: {tg_username}\n"
         f"TG ID: {tg_id}\n"
-        f"Контакт: {contact_label}\n"
-        f"Номер: {phone if phone else '-'}\n\n"
-        "Услуги:\n"
-        f"{service_block}\n\n"
-        "Рекомендовано (апселл):\n"
-        f"{upsells_text}\n\n"
-        f"Статус лида: {temp}"
+        f"Контакт: {'Телефон' if contact_method=='phone' else 'Telegram'}\n"
+        f"Номер: {phone if phone else '—'}\n\n"
+        "Услуги:\n" + "\n".join(svc_lines) + "\n\n"
+        f"Рекомендовано (апселл):\n{upsells_text}\n\n"
+        f"Лид: {temp}"
     )
 
     await context.bot.send_message(chat_id=MANAGER_ID, text=text)
 
-
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Ок, остановил. Если нужно - напиши /start")
+    await update.message.reply_text("Ок, остановил. Если нужно — /start")
     return ConversationHandler.END
 
-
 # -------------------- APP --------------------
-def build_app() -> Application:
+def build_app():
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
@@ -886,15 +890,18 @@ def build_app() -> Application:
             S_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_name)],
             S_CAR: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_car)],
 
-            # IMPORTANT: this pattern must match svc:anything
+            # ВАЖНО: fixed pattern — теперь ловит svc:toning и т.д.
             S_SERVICES: [CallbackQueryHandler(cb_services, pattern=r"^(svc:.*|svc_done|svc_reset)$")],
 
             S_SVC_FLOW: [CallbackQueryHandler(cb_flow)],
+
             S_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_time)],
+
             S_CONTACT: [
                 MessageHandler(filters.CONTACT, on_contact),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, on_contact),
             ],
+
             S_DONE: [
                 CallbackQueryHandler(cb_restart, pattern=r"^restart$"),
                 CommandHandler("start", cmd_start),
@@ -907,13 +914,14 @@ def build_app() -> Application:
     app.add_handler(conv)
     return app
 
-
 def main():
+    # health server for Render Web Service
     t = threading.Thread(target=start_health_server, daemon=True)
     t.start()
 
     app = build_app()
 
+    # anti-conflict loop for free Render deployments
     while True:
         try:
             logger.info("Bot starting polling...")
@@ -927,7 +935,6 @@ def main():
         except Exception:
             logger.exception("Unexpected error. Retry in 5 seconds...")
             time.sleep(5)
-
 
 if __name__ == "__main__":
     main()
